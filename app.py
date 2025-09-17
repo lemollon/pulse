@@ -1,4 +1,4 @@
-# app.py — Pulse (Google Places API v1 + Folium map + ARS + AI + session-state)
+# app.py — Pulse (Google Places API v1 + Folium map + ARS + AI + session-state + ARS shape fix)
 import os
 import json
 import hmac
@@ -221,18 +221,80 @@ def get_place_details(place_id: str):
     return details
 
 # --------------------------------------------------------------------
-# ARS client (inline)
+# ARS client (inline) — robust to different response shapes
 # --------------------------------------------------------------------
 def sign_payload(body_bytes: bytes) -> str:
     return hmac.new(ARS_SECRET, body_bytes, hashlib.sha256).hexdigest()
+
+def _normalize_ars_steps(obj):
+    """
+    Accepts either:
+      - {"arm": "...", "score": 0.9, "steps": [ ... ]}
+      - [ {...}, {...}, {...} ]  (raw list)
+    Returns: (arm, score, steps_list)
+    """
+    arm, score, steps = None, None, []
+    if isinstance(obj, dict):
+        arm = obj.get("arm")
+        score = obj.get("score")
+        raw = obj.get("steps", obj.get("plan", obj.get("data", [])))
+        if isinstance(raw, list):
+            steps = raw
+        elif isinstance(raw, dict) and "steps" in raw and isinstance(raw["steps"], list):
+            steps = raw["steps"]
+    elif isinstance(obj, list):
+        steps = obj
+    # Normalize each step
+    normed = []
+    for s in steps:
+        if not isinstance(s, dict):
+            continue
+        send_dt = s.get("send_dt") or s.get("date") or s.get("when") or ""
+        channel = (s.get("channel") or "").lower() or "email"
+        subject = s.get("subject", "")
+        body = s.get("body", "")
+        # Provide defaults where helpful
+        if channel == "sms" and not subject:
+            subject = ""
+        if channel == "email" and not subject:
+            subject = "Quick follow-up"
+        normed.append({
+            "send_dt": str(send_dt),
+            "channel": channel,
+            "subject": subject,
+            "body": body
+        })
+    return arm, score, normed
 
 def plan_with_ars(lead: dict, context: dict, cohort: str = "donut_shop") -> dict:
     payload = {"cohort": cohort, "lead": lead, "context": context}
     body = json.dumps(payload).encode()
     sig = sign_payload(body)
-    r = requests.post(ARS_URL, headers={"x-signature": sig, "Content-Type": "application/json"}, data=body, timeout=20)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = requests.post(
+            ARS_URL,
+            headers={"x-signature": sig, "Content-Type": "application/json"},
+            data=body,
+            timeout=30
+        )
+        # Don't raise immediately: we want helpful message content if any
+        content_type = r.headers.get("Content-Type", "")
+        text = r.text
+        if not r.ok:
+            # Bubble up body for debugging
+            raise RuntimeError(f"ARS HTTP {r.status_code}: {text[:500]}")
+        try:
+            data = r.json()
+        except Exception:
+            # If backend returned plain text JSON-like, try to parse
+            try:
+                data = json.loads(text)
+            except Exception:
+                raise RuntimeError(f"ARS returned non-JSON: {text[:500]}")
+        arm, score, steps = _normalize_ars_steps(data)
+        return {"arm": arm, "score": score, "steps": steps, "_raw": data}
+    except Exception as e:
+        raise RuntimeError(f"ARS request failed: {e}")
 
 # --------------------------------------------------------------------
 # Helpers
@@ -555,15 +617,16 @@ with tab2:
             "prior_reply_rate": float(prior_rr),
         }
         try:
-            data = plan_with_ars(lead, context, cohort="donut_shop")
+            result = plan_with_ars(lead, context, cohort="donut_shop")
+            steps = result.get("steps", [])
 
-            steps = data.get("steps", [])
-            st.success(f"Chosen arm: {data.get('arm','?')} • Score: {data.get('score','?')}")
+            st.success(f"Chosen arm: {result.get('arm','?')} • Score: {result.get('score','?')}")
             st.markdown("### Planned Steps (before AI polish)")
             for step in steps:
+                subj = step.get("subject", "")
+                subj_str = f"— {subj}" if subj else ""
                 st.markdown(
-                    f"📅 **{step.get('send_dt','')}** — *{step.get('channel','')}* "
-                    f"{'— ' + step.get('subject','') if step.get('subject') else ''}"
+                    f"📅 **{step.get('send_dt','')}** — *{step.get('channel','')}* {subj_str}"
                 )
                 st.write(step.get("body",""))
                 st.markdown("---")
@@ -603,5 +666,3 @@ with tab2:
 
 st.markdown("---")
 st.caption("Pulse © — Google Places (New) competitor insights + private ARS follow-ups.")
-
-
