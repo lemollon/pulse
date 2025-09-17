@@ -1,17 +1,15 @@
-# app.py — Pulse v1.7 "Thinking + Inventory"
-# Adds: visible "🤔 Thinking…" spinners around all long ops + Feature Inventory Check
-# Keeps: Google Places (New) + Folium + Heatmap + Charts + AI Summary/Actions/Playbook
-#        ARS planner + Explainability + TXT/DOCX exports + Guardrails
+# app.py — Pulse v1.7.1 (Theme Toggle + All Features + KPI Fix)
 
 import os, io, re, json, time, hmac, hashlib, textwrap
 import datetime as dt
+from typing import Dict, List
+
 import requests
 import pandas as pd
 import altair as alt
 import streamlit as st
-from typing import Dict, List
 
-# ----- Optional docs export -----
+# ---------- Optional DOCX export ----------
 DOCX_AVAILABLE = True
 try:
     from docx import Document
@@ -19,105 +17,122 @@ try:
 except Exception:
     DOCX_AVAILABLE = False
 
-# ----- Maps -----
+# ---------- Maps ----------
 import folium
 from streamlit_folium import st_folium
 
-# ----- OpenAI (optional) -----
+# ---------- OpenAI (optional) ----------
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
 
-# ---------------------- THEME & STYLE ----------------------
-st.set_page_config(page_title="Pulse — Win Your Neighborhood", page_icon="🧭", layout="wide")
+# ---------------------- Page / Meta ----------------------
+VERSION = "1.7.1"
 PRIMARY = "#6B5BFF"
 ACCENT = "#00C29A"
 
-st.markdown(f"""
-<style>
-.reportview-container .main .block-container {{padding-top: 0.8rem;}}
-div.stButton>button {{background:{PRIMARY}; color:white; border-radius:8px; border:none;}}
-div.stDownloadButton>button {{background:{ACCENT}; color:white; border-radius:8px; border:none;}}
-.kpi {{background:#f8f9fb;border:1px solid #eef1f6;border-radius:12px;padding:10px 14px;margin-bottom:8px;}}
-.section-title {{font-weight:700;font-size:1.1rem;margin-top:1rem;}}
-.small-note {{color:#6b7280;font-size:0.9rem;}}
-hr {{border-top:1px solid #eef1f6;}}
-.badge-ok {{color:#0a7f4f;}}
-.badge-bad {{color:#b91c1c;}}
-</style>
-""", unsafe_allow_html=True)
+st.set_page_config(page_title="Pulse — Win Your Neighborhood", page_icon="🧭", layout="wide")
 
-# ---------------------- GLOBALS ----------------------
-VERSION = "1.7.0"
-CHANGELOG = [
-    "Added visible 'Thinking…' spinners for all heavy ops",
-    "Feature Inventory Check (verifies every major capability)",
-    "Kept: Heatmap, AI promos/playbook, exports, ARS explainability",
-]
-
-FEATURES = {
-    "google_search": True,
-    "map_markers": True,
-    "heatmap": True,
-    "charts": True,
-    "ai_market_summary": True,
-    "ai_suggested_actions": True,
-    "owner_playbook": True,
-    "insights_export_md": True,
-    "ars_planner": True,
-    "ars_explainability": True,
-    "ai_polish": True,
-    "export_txt": True,
-    "export_docx": True,   # hidden if DOCX_AVAILABLE == False
-    "setup_checklist": True,
-    "inventory_check": True,
-}
-
-# ---------------------- SECRETS ----------------------
-def get_secret(name: str, default: str = "") -> str:
+# ---------------------- Secrets ----------------------
+def _secret(name: str, default: str = "") -> str:
     try:
         return st.secrets.get(name, os.getenv(name, default))
     except Exception:
         return os.getenv(name, default)
 
-GOOGLE_PLACES_API_KEY = get_secret("GOOGLE_PLACES_API_KEY", "")
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY", "")
-ARS_URL = get_secret("ARS_URL", "http://localhost:8080/ars/plan")
-ARS_SECRET = get_secret("ARS_SECRET", "ars_secret_2c5d6a3b7a9f4d0c8e1f5a7b3c9d2e4f").encode()
+GOOGLE_PLACES_API_KEY = _secret("GOOGLE_PLACES_API_KEY", "")
+OPENAI_API_KEY        = _secret("OPENAI_API_KEY", "")
+ARS_URL               = _secret("ARS_URL", "http://localhost:8080/ars/plan")
+ARS_SECRET            = _secret("ARS_SECRET", "ars_secret_2c5d6a3b7a9f4d0c8e1f5a7b3c9d2e4f").encode()
 
+# ---------------------- Theme Toggle (forced) ----------------------
+if "theme" not in st.session_state:
+    st.session_state.theme = "dark"  # default
+
+with st.sidebar:
+    st.markdown("### 🎚️ Theme")
+    choice = st.radio("Appearance", ["Dark", "Light"],
+                      index=0 if st.session_state.theme == "dark" else 1)
+    st.session_state.theme = "dark" if choice.lower() == "dark" else "light"
+
+THEME_DARK = st.session_state.theme == "dark"
+
+def inject_css(theme_dark: bool):
+    if theme_dark:
+        card_bg, card_text, card_border = "#0b1220", "#e5e7eb", "#1f2937"
+        btn_download_text = "#0b1220"
+    else:
+        card_bg, card_text, card_border = "#f8fafc", "#0f172a", "#e5e7eb"
+        btn_download_text = "#0b1220"
+
+    st.markdown(f"""
+    <style>
+    :root {{
+      --primary:{PRIMARY};
+      --accent:{ACCENT};
+      --card-bg:{card_bg};
+      --card-text:{card_text};
+      --card-border:{card_border};
+    }}
+    .stButton>button {{
+      background: var(--primary) !important; color:white !important;
+      border-radius:10px; border:none;
+    }}
+    .stDownloadButton>button {{
+      background: var(--accent) !important; color:{btn_download_text} !important;
+      border-radius:10px; border:none; font-weight:700;
+    }}
+    .kpi-card {{
+      background:var(--card-bg); color:var(--card-text);
+      border:1px solid var(--card-border);
+      border-radius:12px; padding:12px 16px;
+    }}
+    .kpi-label {{ font-size:.85rem; opacity:.85; }}
+    .kpi-value {{ font-weight:800; font-size:1.4rem; margin-top:2px; }}
+    .section-title {{ font-weight:700; font-size:1.05rem; margin:1rem 0 .25rem; }}
+    .small-note {{ color:#6b7280; font-size:.9rem; }}
+    </style>
+    """, unsafe_allow_html=True)
+
+inject_css(THEME_DARK)
+
+# ---------------------- OpenAI helpers ----------------------
 client = OpenAI(api_key=OPENAI_API_KEY) if (OPENAI_API_KEY and OpenAI) else None
 def llm_ok() -> bool: return client is not None
 
 def llm(prompt: str, system: str, temp: float = 0.35) -> str:
-    if not llm_ok(): return ""
+    if not llm_ok():
+        return ""
     try:
         r = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"system","content":system},{"role":"user","content":prompt}],
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": prompt}],
             temperature=temp,
         )
         return (r.choices[0].message.content or "").strip()
     except Exception as e:
         return f"(AI unavailable: {e})"
 
-# ---------------------- UTILITIES ----------------------
+# ---------------------- Text helpers ----------------------
 def strip_code_fences(s: str) -> str:
     if not isinstance(s, str): return ""
     s = s.strip()
     if s.startswith("```"):
         s = s[3:]
         s = re.sub(r'^(json|JSON|python|txt)\s*\n', '', s, count=1)
-        if "```" in s: s = s.split("```", 1)[0]
+        if "```" in s:
+            s = s.split("```", 1)[0]
     return s.strip()
 
 def steps_to_markdown(steps: List[Dict]) -> str:
     lines = []
     for step in steps:
-        dtv = step.get("send_dt","")
-        ch = (step.get("channel","") or "").title()
-        subject = step.get("subject","")
-        body = (step.get("body","") or "").strip()
+        dtv = step.get("send_dt", "")
+        ch = (step.get("channel", "") or "").title()
+        subject = step.get("subject", "")
+        body = (step.get("body", "") or "").strip()
         header = f"📅 **{dtv} — {ch}**"
         if ch.lower() == "email" and subject:
             lines += [header, f"**Subject:** {subject}", body, ""]
@@ -129,7 +144,8 @@ def coerce_polished_to_markdown(raw_text: str, fallback_steps: List[Dict]) -> st
     cleaned = strip_code_fences(raw_text or "")
     try:
         obj = json.loads(cleaned)
-        if isinstance(obj, list): return steps_to_markdown(obj)
+        if isinstance(obj, list):
+            return steps_to_markdown(obj)
         if isinstance(obj, dict) and "steps" in obj and isinstance(obj["steps"], list):
             return steps_to_markdown(obj["steps"])
     except Exception:
@@ -153,29 +169,37 @@ def build_docx_bytes(title: str, body_md: str) -> bytes:
             doc.add_paragraph(block.strip())
     buf = io.BytesIO(); doc.save(buf); buf.seek(0); return buf.read()
 
-# ---------------------- GOOGLE PLACES (New) ----------------------
+# ---------------------- Google Places (New) ----------------------
 def gp_headers(field_mask: str):
     if not GOOGLE_PLACES_API_KEY:
         raise RuntimeError("GOOGLE_PLACES_API_KEY not set.")
-    return {"Content-Type":"application/json","X-Goog-Api-Key":GOOGLE_PLACES_API_KEY,"X-Goog-FieldMask":field_mask}
+    return {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+        "X-Goog-FieldMask": field_mask,
+    }
 
 def geocode_location(city: str, state: str, zip_code: str):
     parts = []
     if city.strip(): parts.append(city.strip())
     if state.strip(): parts.append(state.strip())
     address = ", ".join(parts)
-    if zip_code.strip(): address = f"{address} {zip_code.strip()}" if address else zip_code.strip()
-    if not address: return None
+    if zip_code.strip():
+        address = f"{address} {zip_code.strip()}" if address else zip_code.strip()
+    if not address:
+        return None
     url = "https://maps.googleapis.com/maps/api/geocode/json"
-    with st.spinner("🤔 Thinking… geocoding area"):
-        r = requests.get(url, params={"address":address, "key":GOOGLE_PLACES_API_KEY}, timeout=20)
-    r.raise_for_status(); data = r.json()
-    if data.get("status") != "OK": return None
+    r = requests.get(url, params={"address": address, "key": GOOGLE_PLACES_API_KEY}, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("status") != "OK":
+        return None
     loc = data["results"][0]["geometry"]["location"]
     return float(loc["lat"]), float(loc["lng"])
 
 def search_competitors(term: str, city: str, state: str, zip_code: str, limit: int = 12) -> pd.DataFrame:
     err_msg = ""
+    # Text Search
     text_url = "https://places.googleapis.com/v1/places:searchText"
     loc = ", ".join([x for x in [city.strip(), state.strip()] if x])
     loc = f"{loc} {zip_code.strip()}" if zip_code.strip() else loc
@@ -185,28 +209,31 @@ def search_competitors(term: str, city: str, state: str, zip_code: str, limit: i
         "places.id","places.displayName","places.formattedAddress","places.location",
         "places.rating","places.userRatingCount","places.priceLevel",
     ])
-    with st.spinner("🤔 Thinking… searching Google Places"):
-        rt = requests.post(text_url, headers=gp_headers(fields), json=body, timeout=20)
-    rt.raise_for_status(); jt = rt.json()
-    status = jt.get("status","OK"); 
-    if "error" in jt: err_msg = jt["error"].get("message","")
+    rt = requests.post(text_url, headers=gp_headers(fields), json=body, timeout=20)
+    rt.raise_for_status()
+    jt = rt.json()
+    status = jt.get("status", "OK")
+    if "error" in jt: err_msg = jt["error"].get("message", "")
     places = jt.get("places", []) or []
 
+    # Nearby fallback
     if not places:
         geo = geocode_location(city, state, zip_code)
         if geo:
-            lat,lng = geo
+            lat, lng = geo
             nb_url = "https://places.googleapis.com/v1/places:searchNearby"
             nb_body = {
                 "maxResultCount": limit,
-                "locationRestriction": {"circle":{"center":{"latitude":lat,"longitude":lng},"radius":15000.0}},
-                "rankPreference":"RELEVANCE","includedTypes":["bakery","cafe"],
-                "keyword": term or "donut doughnut"
+                "locationRestriction": {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": 15000.0}},
+                "rankPreference": "RELEVANCE",
+                "includedTypes": ["bakery","cafe"],
+                "keyword": term or "donut doughnut",
             }
-            with st.spinner("🤔 Thinking… expanding to nearby search"):
-                rn = requests.post(nb_url, headers=gp_headers(fields), json=nb_body, timeout=20)
-            rn.raise_for_status(); jn = rn.json()
-            if "error" in jn and not err_msg: err_msg = jn["error"].get("message","")
+            rn = requests.post(nb_url, headers=gp_headers(fields), json=nb_body, timeout=20)
+            rn.raise_for_status()
+            jn = rn.json()
+            if "error" in jn and not err_msg:
+                err_msg = jn["error"].get("message","")
             status = f"{status} -> Nearby:{'OK' if 'error' not in jn else 'ERROR'}"
             places = jn.get("places", []) or []
 
@@ -218,36 +245,16 @@ def search_competitors(term: str, city: str, state: str, zip_code: str, limit: i
             "Name": name,
             "Rating": float(p.get("rating", 0) or 0),
             "Reviews": int(p.get("userRatingCount", 0) or 0),
-            "Address": p.get("formattedAddress",""),
+            "Address": p.get("formattedAddress", ""),
             "PriceLevel": p.get("priceLevel", None),
             "Lat": locd.get("latitude", None),
             "Lng": locd.get("longitude", None),
             "PlaceID": p.get("id", p.get("name","").split("/")[-1]),
         })
-    df = pd.DataFrame(out); df._search_status = status; df._error_message = err_msg
+    df = pd.DataFrame(out)
+    df._search_status = status
+    df._error_message = err_msg
     return df
-
-def get_place_details(place_id: str) -> Dict:
-    res = place_id if place_id.startswith("places/") else f"places/{place_id}"
-    url = f"https://places.googleapis.com/v1/{res}"
-    fields = ",".join([
-        "id","displayName","formattedAddress","location","rating","userRatingCount",
-        "priceLevel","nationalPhoneNumber","websiteUri","regularOpeningHours.weekdayDescriptions"
-    ])
-    with st.spinner("🤔 Thinking… fetching place details"):
-        r = requests.get(url, headers=gp_headers(fields), timeout=20)
-    r.raise_for_status(); d = r.json()
-    return {
-        "name": (d.get("displayName") or {}).get("text",""),
-        "rating": float(d.get("rating",0) or 0),
-        "user_ratings_total": int(d.get("userRatingCount",0) or 0),
-        "formatted_address": d.get("formattedAddress",""),
-        "formatted_phone_number": d.get("nationalPhoneNumber",""),
-        "price_level": d.get("priceLevel", None),
-        "website": d.get("websiteUri",""),
-        "opening_hours": {"weekday_text": (d.get("regularOpeningHours") or {}).get("weekdayDescriptions", [])},
-        "reviews": d.get("reviews", []),
-    }
 
 # ---------------------- ARS ----------------------
 def sign_payload(body_bytes: bytes) -> str:
@@ -258,9 +265,12 @@ def _normalize_ars_steps(obj):
     if isinstance(obj, dict):
         arm = obj.get("arm"); score = obj.get("score")
         raw = obj.get("steps", obj.get("plan", obj.get("data", [])))
-        if isinstance(raw, list): steps = raw
-        elif isinstance(raw, dict) and "steps" in raw and isinstance(raw["steps"], list): steps = raw["steps"]
-    elif isinstance(obj, list): steps = obj
+        if isinstance(raw, list):
+            steps = raw
+        elif isinstance(raw, dict) and "steps" in raw and isinstance(raw["steps"], list):
+            steps = raw["steps"]
+    elif isinstance(obj, list):
+        steps = obj
     normed = []
     for s in steps:
         if not isinstance(s, dict): continue
@@ -268,43 +278,39 @@ def _normalize_ars_steps(obj):
         channel = (s.get("channel") or "").lower() or "email"
         subject = s.get("subject","") if channel=="email" else ""
         body = s.get("body","")
-        if channel=="email" and not subject: subject="Quick follow-up"
+        if channel=="email" and not subject: subject = "Quick follow-up"
         normed.append({"send_dt":str(send_dt), "channel":channel, "subject":subject, "body":body})
     return arm, score, normed
 
 def plan_with_ars(lead: Dict, context: Dict, cohort="donut_shop") -> Dict:
     payload = {"cohort":cohort, "lead":lead, "context":context}
-    body = json.dumps(payload).encode(); sig = sign_payload(body)
-    with st.spinner("🤔 Thinking… calling ARS for your plan"):
-        r = requests.post(ARS_URL, headers={"x-signature":sig,"Content-Type":"application/json"},
-                          data=body, timeout=45)
+    body = json.dumps(payload).encode()
+    sig = sign_payload(body)
+    r = requests.post(ARS_URL, headers={"x-signature":sig,"Content-Type":"application/json"}, data=body, timeout=45)
     text = r.text
-    if not r.ok: raise RuntimeError(f"ARS HTTP {r.status_code}: {text[:300]}")
-    try: data = r.json()
-    except Exception: data = json.loads(text)
+    if not r.ok:
+        raise RuntimeError(f"ARS HTTP {r.status_code}: {text[:300]}")
+    try:
+        data = r.json()
+    except Exception:
+        data = json.loads(text)
     arm, score, steps = _normalize_ars_steps(data)
     return {"arm":arm, "score":score, "steps":steps, "_raw":data}
 
-def ars_health() -> str:
-    try:
-        health_url = ARS_URL.replace("/ars/plan", "/healthz")
-        with st.spinner("🤔 Thinking… pinging ARS /healthz"):
-            resp = requests.get(health_url, timeout=15)
-        return f"{resp.status_code} {resp.text[:200]}"
-    except Exception as e:
-        return f"ERR {e}"
-
-# ---------------------- ANALYTICS / SCORING ----------------------
+# ---------------------- Analytics / Viz helpers ----------------------
 def opportunity_score(row):
-    rating = float(row["Rating"] or 0); reviews = int(row["Reviews"] or 0)
-    base = max(0.0, 5.0 - rating)
+    rating = float(row["Rating"] or 0)
+    reviews = int(row["Reviews"] or 0)
+    base = max(0.0, 5.0 - rating)                # lower rating => more opportunity
     big_player = 1.0 if (reviews >= 300 and rating < 4.2) else 0.0
     sleeper    = 1.0 if (reviews < 60 and rating >= 4.5) else 0.0
     return round(base + 1.5*big_player + 0.8*sleeper, 2)
 
 def render_folium_map(df: pd.DataFrame, heatmap: bool = True):
     dfc = df.dropna(subset=["Lat","Lng"]).copy()
-    if dfc.empty: st.info("No coordinates to plot."); return
+    if dfc.empty:
+        st.info("No coordinates to plot.")
+        return
     m = folium.Map(location=[dfc["Lat"].mean(), dfc["Lng"].mean()], zoom_start=12, control_scale=True)
     for _, r in dfc.iterrows():
         popup = folium.Popup(
@@ -325,88 +331,60 @@ def render_folium_map(df: pd.DataFrame, heatmap: bool = True):
             ).add_to(m)
     st_folium(m, width=None, height=540)
 
-# ---------------------- CONTENT BUILDERS ----------------------
-def build_insights_md(term, city, state, df_view, opp_view, playbook_text=""):
+def insights_md(term, city, state, df_view, opp_view, playbook_text=""):
     lines = [f"# Pulse Insights — {term} in {city}, {state}", ""]
     if not df_view.empty:
-        lines += [f"- Shown: **{len(df_view)}**",
-                  f"- Avg rating: **{df_view['Rating'].mean():.2f}**",
-                  f"- Median reviews: **{int(df_view['Reviews'].median())}**", ""]
+        lines += [
+            f"- Shown: **{len(df_view)}**",
+            f"- Avg rating: **{df_view['Rating'].mean():.2f}**",
+            f"- Median reviews: **{int(df_view['Reviews'].median())}**",
+            ""
+        ]
     lines += ["## Top Opportunities", ""]
     if opp_view is not None and not opp_view.empty:
         for _, r in opp_view.iterrows():
             act = str(r.get("Suggested Action","")).strip()
             lines += [f"- **{r['Name']}** — Opportunity {r['Opportunity']:.2f} "
-                      f"(Rating {r['Rating']}, Reviews {r['Reviews']})"
-                      + (f" — {act}" if act else "")]
-    else:
-        lines += ["(No opportunities identified in current filter.)"]
+                      f"(Rating {r['Rating']}, Reviews {r['Reviews']})" + (f" — {act}" if act else "")]
     if playbook_text:
         lines += ["", "## Owner Playbook", "", playbook_text]
     lines += ["", f"_Pulse v{VERSION}_"]
     return "\n".join(lines)
 
-# ---------------------- STARTUP SELF-TEST ----------------------
-def startup_self_test():
-    issues = []
-    if not FEATURES["google_search"]: issues.append("Google search feature flag off.")
-    if not GOOGLE_PLACES_API_KEY: issues.append("Missing GOOGLE_PLACES_API_KEY.")
-    if FEATURES["export_docx"] and not DOCX_AVAILABLE:
-        issues.append("python-docx not installed; DOCX export will be hidden.")
-    return issues
-
-# ---------------------- SESSION DEFAULTS ----------------------
-if "search_df" not in st.session_state: st.session_state.search_df = None
+# ---------------------- Session defaults ----------------------
+if "search_df" not in st.session_state:
+    st.session_state.search_df = None
 if "search_inputs" not in st.session_state:
-    st.session_state.search_inputs = {"term":"doughnut shop","city":"Fulshear","state":"TX","zip_code":"77441","limit":12}
+    st.session_state.search_inputs = {"term":"doughnut shop", "city":"Fulshear", "state":"TX", "zip_code":"77441", "limit":12}
 
-# ---------------------- HEADER ----------------------
+# ---------------------- Header ----------------------
 left, right = st.columns([3,1])
 with left:
     st.write(f"**Pulse v{VERSION}** — Win your neighborhood with AI.")
 with right:
-    if st.button("View changelog"):
-        st.info("\n".join(f"- {c}" for c in CHANGELOG))
+    if st.button("View what's in this build"):
+        st.info("\n".join([
+            "• Theme toggle (forced light/dark)",
+            "• KPI fix + high-contrast UI",
+            "• Google Places (New) search + Nearby fallback",
+            "• Folium map + heat glow",
+            "• AI Market Summary, Opportunity Finder (AI actions)",
+            "• Owner Playbook, Steal-Share Plays",
+            "• Insights.md, TXT & DOCX exports",
+            "• ARS plan + explainability + AI polish"
+        ]))
 
-issues = startup_self_test()
-if issues:
-    with st.expander("⚙️ Setup checklist & warnings"):
-        for i in issues: st.warning(i)
-        st.caption("This checklist prevents silent regressions.")
-
-# ---------------------- FEATURE INVENTORY CHECK ----------------------
-def run_inventory_check() -> List[str]:
-    checks = []
-    checks.append(("Google Places key", bool(GOOGLE_PLACES_API_KEY)))
-    checks.append(("Map render", FEATURES["map_markers"]))
-    checks.append(("Heatmap overlay", FEATURES["heatmap"]))
-    checks.append(("Charts", FEATURES["charts"]))
-    checks.append(("AI Market Summary", FEATURES["ai_market_summary"] and llm_ok()))
-    checks.append(("AI Suggested Actions", FEATURES["ai_suggested_actions"] and llm_ok()))
-    checks.append(("Owner Playbook", FEATURES["owner_playbook"] and llm_ok()))
-    checks.append(("Insights export (MD)", FEATURES["insights_export_md"]))
-    checks.append(("ARS planner URL", FEATURES["ars_planner"] and bool(ARS_URL)))
-    checks.append(("AI polish", FEATURES["ai_polish"] and llm_ok()))
-    checks.append(("TXT export", FEATURES["export_txt"]))
-    checks.append(("DOCX export", FEATURES["export_docx"] and DOCX_AVAILABLE))
-    return [f"{'✅' if ok else '❌'} {name}" for name, ok in checks]
-
-with st.expander("🧪 Feature Inventory Check"):
-    if st.button("Run inventory check"):
-        results = run_inventory_check()
-        st.write("\n".join(results))
-
-# ---------------------- TABS ----------------------
+# ---------------------- Tabs ----------------------
 tab1, tab2 = st.tabs(["⭐ Competitor Watch", "📬 Lead Follow-Up (ARS)"])
 
 # ===================== TAB 1 =====================
 with tab1:
     st.subheader("Find similar businesses via Google Places")
-    st.caption("Facts from Google. AI turns it into moves you can take this week.")
+    st.caption("Facts from Google. AI turns it into moves you can ship this week.")
 
     with st.form("search_form"):
         inputs = st.session_state.search_inputs
-        c1,c2,c3 = st.columns([1.3,1,1])
+        c1, c2, c3 = st.columns([1.3,1,1])
         with c1: term = st.text_input("Category/term", inputs.get("term","doughnut shop"))
         with c2:
             city = st.text_input("City", inputs.get("city","Fulshear"))
@@ -422,7 +400,6 @@ with tab1:
 
     if submitted:
         try:
-            st.info("Searching similar businesses…")
             df = search_competitors(term, city, state, zip_code, limit=limit)
             st.session_state.search_inputs = {"term":term,"city":city,"state":state,"zip_code":zip_code,"limit":limit}
             if df.empty:
@@ -430,17 +407,17 @@ with tab1:
                 (st.error if em else st.warning)(f"No results. Google status: {msg} {'| '+em if em else ''}")
                 st.session_state.search_df = None
             else:
-                st.success("Done! Showing results.")
                 st.session_state.search_df = df
         except Exception as e:
-            st.error(f"Google Places error: {e}"); st.session_state.search_df = None
+            st.error(f"Google Places error: {e}")
+            st.session_state.search_df = None
 
     df = st.session_state.search_df
     if df is None:
         st.info("Enter a search and press **Search** to see competitors.")
         st.stop()
 
-    # Filters
+    # ---- Filters
     f1,f2,f3 = st.columns(3)
     with f1: min_reviews = st.slider("Min reviews", 0, int(df["Reviews"].max() or 0), 10, step=5)
     with f2: min_rating  = st.slider("Min rating", 0.0, 5.0, 3.5, step=0.1)
@@ -449,104 +426,135 @@ with tab1:
     dff = df[(df["Reviews"]>=min_reviews) & (df["Rating"]>=min_rating)].copy()
     dff = dff.sort_values(["Reviews","Rating"], ascending=[False,False]).head(top_n)
 
-    # KPIs
-    k1,k2,k3 = st.columns(3)
-    with k1: st.markdown(f"<div class='kpi'><b>Shown</b><br>{len(dff)}</div>", unsafe_allow_html=True)
-    with k2: st.markdown(f"<div class='kpi'><b>Avg rating</b><br>{dff['Rating'].mean():.2f if len(dff) else '–'}</div>", unsafe_allow_html=True)
-    with k3: st.markdown(f"<div class='kpi'><b>Median reviews</b><br>{int(dff['Reviews'].median() if len(dff) else 0)}</div>", unsafe_allow_html=True)
+    # ---- KPI (bug-free formatting)
+    shown = int(len(dff))
+    avg_rating_val = float(dff["Rating"].mean()) if shown else None
+    med_reviews_val = int(dff["Reviews"].median()) if shown else None
+    avg_rating_str = f"{avg_rating_val:.2f}" if avg_rating_val is not None else "–"
+    med_reviews_str = f"{med_reviews_val}" if med_reviews_val is not None else "–"
 
-    # Map + Heat
+    def kpi_card(label: str, value: str) -> str:
+        return f"""
+        <div class="kpi-card">
+          <div class="kpi-label">{label}</div>
+          <div class="kpi-value">{value}</div>
+        </div>
+        """
+
+    k1, k2, k3 = st.columns(3)
+    with k1: st.markdown(kpi_card("Shown", str(shown)), unsafe_allow_html=True)
+    with k2: st.markdown(kpi_card("Avg rating", avg_rating_str), unsafe_allow_html=True)
+    with k3: st.markdown(kpi_card("Median reviews", med_reviews_str), unsafe_allow_html=True)
+
+    # ---- Map + heat glow
     st.markdown("<div class='section-title'>Map & Heat</div>", unsafe_allow_html=True)
-    st.caption("Hover pins for name/rating/reviews. Colored circles show density (hot = tougher, cool = gaps).")
+    st.caption("Hover pins for name/rating/reviews. Colored circles hint at density (hot vs gaps).")
     render_folium_map(dff, heatmap=True)
 
-    # Charts
+    # ---- Charts
     st.markdown("<div class='section-title'>Top 10 by reviews — Local awareness leaderboard</div>", unsafe_allow_html=True)
     if not dff.empty:
-        bar = (alt.Chart(dff.sort_values(["Reviews","Rating"], ascending=[False,False]).head(10))
-               .mark_bar().encode(x=alt.X("Name:N", sort='-y'), y="Reviews:Q",
-                                  tooltip=["Name","Rating","Reviews"]).properties(height=320))
+        bar = (
+            alt.Chart(dff.sort_values(["Reviews","Rating"], ascending=[False,False]).head(10))
+            .mark_bar()
+            .encode(x=alt.X("Name:N", sort='-y', title="Business"),
+                    y=alt.Y("Reviews:Q", title="Review count"),
+                    tooltip=["Name","Rating","Reviews"])
+            .properties(height=320)
+        )
+        if THEME_DARK:
+            bar = bar.configure_axis(labelColor='#e5e7eb', titleColor='#e5e7eb').configure_legend(labelColor='#e5e7eb', titleColor='#e5e7eb')
         st.altair_chart(bar, use_container_width=True)
         st.caption("Use: copy what top players do well; target their weak hours/locations with promos.")
 
     st.markdown("<div class='section-title'>Rating vs. Review Volume — Who’s loved vs. who’s loud</div>", unsafe_allow_html=True)
     if not dff.empty:
-        scatter = (alt.Chart(dff).mark_circle(size=80)
-                   .encode(x=alt.X("Reviews:Q", title="Review count"), y=alt.Y("Rating:Q"),
-                           tooltip=["Name","Rating","Reviews","Address"]).interactive().properties(height=320))
+        scatter = (
+            alt.Chart(dff)
+            .mark_circle(size=80)
+            .encode(x=alt.X("Reviews:Q", title="Review count"),
+                    y=alt.Y("Rating:Q", title="Rating"),
+                    tooltip=["Name","Rating","Reviews","Address"])
+            .interactive()
+            .properties(height=320)
+        )
+        if THEME_DARK:
+            scatter = scatter.configure_axis(labelColor='#e5e7eb', titleColor='#e5e7eb')
         st.altair_chart(scatter, use_container_width=True)
         st.caption("Top-right = winners; bottom-right = big but weak (ripe to steal). Top-left = sleepers.")
 
-    # AI Market Summary
+    # ---- AI Market Summary
     if llm_ok() and not dff.empty:
         sample = dff.head(12)[["Name","Rating","Reviews","Address"]].to_dict(orient="records")
         prompt = ("Summarize local competition in 4 sentences and list 2 quick tests. "
                   "Keep it practical for a donut/coffee shop.\n"
                   f"Data:\n{json.dumps(sample)}")
-        with st.spinner("🤔 Thinking… writing AI market summary"):
-            st.markdown("<div class='section-title'>AI Market Summary</div>", unsafe_allow_html=True)
-            st.info(llm(prompt, system="You are a practical SMB strategist."))
+        st.markdown("<div class='section-title'>AI Market Summary</div>", unsafe_allow_html=True)
+        st.info(llm(prompt, system="You are a practical SMB strategist."))
 
-    # Opportunity Finder + AI Actions
+    # ---- Opportunity Finder + AI Actions
     st.markdown("<div class='section-title'>🔎 Opportunity Finder</div>", unsafe_allow_html=True)
     opp = None
     if not dff.empty:
         dff["Opportunity"] = dff.apply(opportunity_score, axis=1)
-        opp = dff.sort_values("Opportunity", ascending=False)[["Name","Rating","Reviews","Opportunity","Address"]].head(5).copy()
+        opp = dff.sort_values("Opportunity", ascending=False)[
+            ["Name","Rating","Reviews","Opportunity","Address"]
+        ].head(5).copy()
+
         if llm_ok():
             acts = []
-            with st.spinner("🤔 Thinking… generating suggested actions"):
-                for row in opp.to_dict(orient="records"):
-                    p = ("Suggest one high-ROI, low-lift action to win share from this competitor in 7 days. "
-                         "1–2 sentences, concrete.\n"
-                         f"Competitor: {json.dumps(row)}")
-                    acts.append(llm(p, system="You are a scrappy local growth marketer."))
+            for row in opp.to_dict(orient="records"):
+                p = ("Suggest one high-ROI, low-lift action to win share from this competitor in 7 days. "
+                     "1–2 sentences, concrete.\n"
+                     f"Competitor: {json.dumps(row)}")
+                acts.append(llm(p, system="You are a scrappy local growth marketer."))
             opp["Suggested Action"] = acts
         else:
             opp["Suggested Action"] = "Add OPENAI_API_KEY to see tailored actions."
         st.dataframe(opp, use_container_width=True)
 
-    # AI Promo Generator (5 campaigns)
+    # ---- AI Promo Generator (5 campaigns)
     promos_text = ""
     if llm_ok() and not dff.empty:
         p_prompt = ("Create 5 micro-campaign ideas tailored to these competitors and morning commute patterns. "
                     "Each: a title + 1 sentence, include timing (e.g., 7-9am) and channel (SMS/email/in-store).\n"
                     f"Data:\n{json.dumps(dff.head(12).to_dict(orient='records'))}")
-        with st.spinner("🤔 Thinking… drafting steal-share plays"):
-            st.markdown("<div class='section-title'>🎯 Steal-Share Plays (AI)</div>", unsafe_allow_html=True)
-            promos_text = llm(p_prompt, system="You are a local growth hacker writing concise play ideas.")
-            st.info(promos_text)
+        st.markdown("<div class='section-title'>🎯 Steal-Share Plays (AI)</div>", unsafe_allow_html=True)
+        promos_text = llm(p_prompt, system="You are a local growth hacker writing concise play ideas.")
+        st.info(promos_text)
 
-    # Owner Playbook
+    # ---- Owner Playbook
     playbook_text = ""
     if llm_ok() and not dff.empty:
         pb = ("Write a 5-bullet, 14-day playbook for this shop based on the competition list. "
               "Prioritize quick wins, morning rush, pre-orders, offices.\n"
               f"Data:\n{json.dumps(dff.head(12).to_dict(orient='records'))}")
-        with st.spinner("🤔 Thinking… assembling owner playbook"):
-            st.markdown("<div class='section-title'>📓 Owner Playbook (AI)</div>", unsafe_allow_html=True)
-            playbook_text = llm(pb, system="You are a practical small-business coach.")
-            st.info(playbook_text)
+        st.markdown("<div class='section-title'>📓 Owner Playbook (AI)</div>", unsafe_allow_html=True)
+        playbook_text = llm(pb, system="You are a practical small-business coach.")
+        st.info(playbook_text)
 
-    # Export insights kit
+    # ---- Insights export
     term = st.session_state.search_inputs.get("term","doughnut shop")
     city = st.session_state.search_inputs.get("city","")
     state = st.session_state.search_inputs.get("state","")
-    insights_md = build_insights_md(term, city, state, dff, opp, playbook_text=playbook_text)
-    st.download_button("⬇️ Download Insights.md", insights_md.encode("utf-8"),
-                       "insights.md", "text/markdown")
+    md = insights_md(term, city, state, dff, opp, playbook_text=playbook_text)
+    st.download_button("⬇️ Download Insights.md", md.encode("utf-8"), "insights.md", "text/markdown")
 
 # ===================== TAB 2 =====================
 with tab2:
     st.subheader("Adaptive Follow-Ups (ARS) + AI Polish")
     st.caption("ARS picks channels/dates; AI polishes copy. Owners get ready-to-send messages.")
 
-    # Diagnostics
     st.sidebar.header("⚙️ Diagnostics")
     if st.sidebar.button("Test ARS connection"):
-        st.sidebar.write(ars_health())
+        try:
+            lead = {"name":"Test","contact":"test@example.com"}
+            context = {"today": str(dt.date.today()), "hour_local": dt.datetime.now().hour, "weekend": False}
+            result = plan_with_ars(lead, context, cohort="diagnostic")
+            st.sidebar.success(f"ARS OK — {len(result.get('steps', []))} steps")
+        except Exception as e:
+            st.sidebar.error(f"ARS error: {e}")
 
-    # Inputs
     ca, cb = st.columns(2)
     with ca:
         lead_name = st.text_input("Lead name", "Jane Smith")
@@ -560,7 +568,8 @@ with tab2:
         prior_rr  = st.number_input("Prior reply rate (0..1)", value=0.12, step=0.01, format="%.2f")
 
     if st.button("Generate Follow-Up Plan"):
-        lead = {"name":lead_name, "contact":contact, "channel_pref":pref, "notes":notes, "last_interaction":str(dt.date.today())}
+        lead = {"name":lead_name, "contact":contact, "channel_pref":pref,
+                "notes":notes, "last_interaction":str(dt.date.today())}
         context = {"today":str(dt.date.today()), "hour_local":dt.datetime.now().hour,
                    "weekend": dt.date.today().weekday()>=5, "holiday_flag": False,
                    "avg_sentiment_7d": float(avg_sent7), "complaint_wait_time": float(wait_iss),
@@ -568,14 +577,16 @@ with tab2:
         try:
             result = plan_with_ars(lead, context, cohort="donut_shop")
             steps = result.get("steps", [])
+
             st.success(f"Chosen arm: {result.get('arm','?')} • Score: {result.get('score','?')}")
             st.markdown("#### Planned Steps (before AI polish)")
             for s in steps:
                 subj = s.get("subject",""); subj_str = f" — {subj}" if subj else ""
                 st.markdown(f"📅 **{s.get('send_dt','')}** — *{s.get('channel','')}*{subj_str}")
-                st.write(s.get("body","")); st.markdown("---")
+                st.write(s.get("body",""))
+                st.markdown("---")
 
-            # Why this plan
+            # Explainability
             reasons = []
             if pref == "sms": reasons.append("Lead prefers SMS, so we include SMS early.")
             hr = dt.datetime.now().hour
@@ -589,45 +600,34 @@ with tab2:
             # AI polish
             polished_text = steps_to_markdown(steps)
             if llm_ok() and steps:
-                prompt = (
-                    "Polish these steps for a friendly donut shop brand. "
-                    "Keep SAME dates/channels; concise, warm, action-oriented. "
-                    "Return PLAIN TEXT (no JSON, no code fences). "
-                    f"Steps JSON:\n{json.dumps(steps)}"
-                )
-                with st.spinner("🤔 Thinking… polishing copy"):
-                    raw = llm(prompt, system="You write high-converting SMB follow-ups.")
+                prompt = ("Polish these steps for a friendly donut shop brand. "
+                          "Keep SAME dates/channels; concise, warm, action-oriented. "
+                          "Return PLAIN TEXT (no JSON, no code fences). "
+                          f"Steps JSON:\n{json.dumps(steps)}")
+                raw = llm(prompt, system="You write high-converting SMB follow-ups.")
                 polished_text = coerce_polished_to_markdown(raw, steps)
                 st.markdown("#### AI-Polished Copy")
                 st.markdown(polished_text)
 
-            # Exports
-            st.download_button("⬇️ Download polished plan (TXT)",
-                               build_txt_bytes("Polished Follow-Up Plan", polished_text),
-                               "polished_followup.txt","text/plain")
+            # Downloads
+            st.download_button(
+                "⬇️ Download polished plan (TXT)",
+                build_txt_bytes("Polished Follow-Up Plan", polished_text),
+                "polished_followup.txt","text/plain"
+            )
             if DOCX_AVAILABLE:
-                st.download_button("⬇️ Download polished plan (DOCX)",
-                                   build_docx_bytes("Polished Follow-Up Plan", polished_text),
-                                   "polished_followup.docx",
-                                   "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                st.download_button(
+                    "⬇️ Download polished plan (DOCX)",
+                    build_docx_bytes("Polished Follow-Up Plan", polished_text),
+                    "polished_followup.docx",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                )
             else:
                 st.caption("Install `python-docx` to enable DOCX export.")
-
-            # Campaigns export (if promos were generated on Tab 1)
-            if llm_ok():
-                campaigns_txt = f"Steal-Share Plays\n\n{promos_text or 'Run a Competitor Watch first to generate promos.'}"
-                st.download_button("⬇️ Download campaigns (TXT)", campaigns_txt.encode("utf-8"),
-                                   "campaigns.txt","text/plain")
-                if DOCX_AVAILABLE:
-                    st.download_button("⬇️ Download campaigns (DOCX)",
-                                       build_docx_bytes("Steal-Share Plays", campaigns_txt),
-                                       "campaigns.docx",
-                                       "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-
         except Exception as e:
             st.error(f"ARS error: {e}")
 
-# ---------------------- FOOTER ----------------------
+# ---------------------- Footer ----------------------
 st.markdown("---")
-st.caption(f"Pulse v{VERSION} • Features OK: " + ", ".join([k for k,v in FEATURES.items() if v]) +
-           (" • DOCX enabled" if DOCX_AVAILABLE else " • DOCX not installed"))
+st.caption(f"Pulse v{VERSION} • Theme: {'Dark' if THEME_DARK else 'Light'} • "
+           f"{'DOCX enabled' if DOCX_AVAILABLE else 'DOCX not installed'}")
