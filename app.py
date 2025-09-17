@@ -1,4 +1,4 @@
-# app.py
+# app.py  — Pulse (Google Places API v1 + ARS)
 import os
 import json
 import hmac
@@ -30,109 +30,175 @@ if not GOOGLE_PLACES_API_KEY:
     st.warning("Missing GOOGLE_PLACES_API_KEY. Add it in Streamlit Secrets to enable Google Places search.")
 
 # --------------------------------------------------------------------
-# Google Places (robust: Text Search -> fallback to Nearby via Geocode)
+# Google Places (New, v1): Text Search -> fallback to Nearby via Geocode
+# Docs: https://developers.google.com/maps/documentation/places/web-service/overview
 # --------------------------------------------------------------------
-def gp_base_params():
+def gp_headers(field_mask: str):
     if not GOOGLE_PLACES_API_KEY:
         raise RuntimeError("GOOGLE_PLACES_API_KEY not set.")
-    return {"key": GOOGLE_PLACES_API_KEY}
+    return {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+        "X-Goog-FieldMask": field_mask,   # which fields to return
+    }
 
 def geocode_location(city: str, state: str, zip_code: str):
-    """
-    Turn 'Fulshear, TX 77441' into lat/lng using the Geocoding API.
-    NOTE: Enable 'Geocoding API' in Google Cloud and include it in key restrictions.
-    """
-    address_parts = []
-    if city.strip(): address_parts.append(city.strip())
-    if state.strip(): address_parts.append(state.strip())
-    address = ", ".join(address_parts)
+    """Geocode to get a lat/lng for Nearby fallback (uses Geocoding API)."""
+    parts = []
+    if city.strip(): parts.append(city.strip())
+    if state.strip(): parts.append(state.strip())
+    address = ", ".join(parts)
     if zip_code.strip():
         address = f"{address} {zip_code.strip()}" if address else zip_code.strip()
     if not address:
         return None
-
     url = "https://maps.googleapis.com/maps/api/geocode/json"
-    params = gp_base_params() | {"address": address}
+    params = {"address": address, "key": GOOGLE_PLACES_API_KEY}
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
     data = r.json()
-    status = data.get("status")
-    if status != "OK":
+    if data.get("status") != "OK":
         return None
     loc = data["results"][0]["geometry"]["location"]
     return float(loc["lat"]), float(loc["lng"])
 
 def search_competitors(term: str, city: str, state: str, zip_code: str, limit: int = 12):
     """
-    1) Text Search (broad, natural language)
-    2) If zero results: Nearby Search around geocoded city/ZIP (radius 15km) with keyword
-    Returns a DataFrame with normalized fields and attaches _search_status for debugging.
+    Places API (New):
+      1) /v1/places:searchText
+      2) Fallback: /v1/places:searchNearby around geocoded city/ZIP (15km)
+    Returns a DataFrame; attaches _search_status and _error_message for debugging.
     """
-    # --- Try Text Search ---
-    text_url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-    q_parts = []
-    if term.strip(): q_parts.append(term.strip())
-    loc_parts = []
+    err_msg = ""
+
+    # -------- Text Search --------
+    text_url = "https://places.googleapis.com/v1/places:searchText"
+    loc_parts, q_parts = [], []
     if city.strip(): loc_parts.append(city.strip())
     if state.strip(): loc_parts.append(state.strip())
     loc = ", ".join(loc_parts)
     if zip_code.strip():
         loc = f"{loc} {zip_code.strip()}" if loc else zip_code.strip()
-    query = f"{' '.join(q_parts)} in {loc}" if loc else ' '.join(q_parts) or "donut shop"
-    text_params = gp_base_params() | {"query": query}
+    if term.strip(): q_parts.append(term.strip())
+    query = f"{' '.join(q_parts)} in {loc}" if loc else (' '.join(q_parts) or "donut shop")
 
-    r = requests.get(text_url, params=text_params, timeout=20)
-    r.raise_for_status()
-    j = r.json()
-    status = j.get("status", "UNKNOWN")
-    use_results = j.get("results", [])[:limit]
+    text_body = {"textQuery": query, "maxResultCount": limit}
+    text_fields = ",".join([
+        "places.id",
+        "places.displayName",
+        "places.formattedAddress",
+        "places.location",
+        "places.rating",
+        "places.userRatingCount",
+        "places.priceLevel",
+    ])
+    rt = requests.post(text_url, headers=gp_headers(text_fields), json=text_body, timeout=20)
+    rt.raise_for_status()
+    jt = rt.json()
+    status = jt.get("status", "OK")  # v1 usually omits 'status' when OK
+    if "error" in jt:
+        err_msg = jt["error"].get("message", "")
+    places = jt.get("places", []) or []
 
-    # --- Fallback: Nearby around geocoded coordinates ---
-    if not use_results:
+    # -------- Fallback: Nearby --------
+    if not places:
         geo = geocode_location(city, state, zip_code)
         if geo:
             lat, lng = geo
-            nearby_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
-            nearby_params = gp_base_params() | {
-                "location": f"{lat},{lng}",
-                "radius": 15000,  # 15km
-                "keyword": term or "donut doughnut",
-                # Optional: "type": "bakery",
+            nearby_url = "https://places.googleapis.com/v1/places:searchNearby"
+            nearby_body = {
+                "maxResultCount": limit,
+                "locationRestriction": {
+                    "circle": {
+                        "center": {"latitude": lat, "longitude": lng},
+                        "radius": 15000.0  # meters (15km)
+                    }
+                },
+                "rankPreference": "RELEVANCE",
+                "includedTypes": ["bakery", "cafe"],  # sane defaults
+                "keyword": term or "donut doughnut"
             }
-            rn = requests.get(nearby_url, params=nearby_params, timeout=20)
+            nf = ",".join([
+                "places.id",
+                "places.displayName",
+                "places.formattedAddress",
+                "places.location",
+                "places.rating",
+                "places.userRatingCount",
+                "places.priceLevel",
+            ])
+            rn = requests.post(nearby_url, headers=gp_headers(nf), json=nearby_body, timeout=20)
             rn.raise_for_status()
             jn = rn.json()
-            status = f"{status} -> Nearby:{jn.get('status','UNKNOWN')}"
-            use_results = jn.get("results", [])[:limit]
+            if "error" in jn and not err_msg:
+                err_msg = jn["error"].get("message", "")
+            status = f"{status} -> Nearby:{'OK' if 'error' not in jn else 'ERROR'}"
+            places = jn.get("places", []) or []
 
-    # Normalize
+    # -------- Normalize to DataFrame --------
     out = []
-    for p in use_results:
-        loc2 = (p.get("geometry") or {}).get("location") or {}
+    for p in places[:limit]:
+        name = ((p.get("displayName") or {}).get("text")) or p.get("name","").split("/")[-1]
+        loc = p.get("location") or {}
         out.append({
-            "Name": p.get("name", ""),
+            "Name": name,
             "Rating": float(p.get("rating", 0) or 0),
-            "Reviews": int(p.get("user_ratings_total", 0) or 0),
-            "Address": p.get("formatted_address", p.get("vicinity", "")),
-            "PriceLevel": p.get("price_level", None),
-            "Lat": loc2.get("lat", None),
-            "Lng": loc2.get("lng", None),
-            "PlaceID": p.get("place_id", "")
+            "Reviews": int(p.get("userRatingCount", 0) or 0),
+            "Address": p.get("formattedAddress", ""),
+            "PriceLevel": p.get("priceLevel", None),
+            "Lat": loc.get("latitude", None),
+            "Lng": loc.get("longitude", None),
+            "PlaceID": p.get("id", p.get("name","").split("/")[-1]),
         })
     df = pd.DataFrame(out)
     df._search_status = status
+    df._error_message = err_msg
     return df
 
 def get_place_details(place_id: str):
-    url = "https://maps.googleapis.com/maps/api/place/details/json"
+    """
+    Places API (New) details call.
+    GET /v1/places/{place_id}
+    """
+    if place_id.startswith("places/"):
+        resource = place_id
+    else:
+        resource = f"places/{place_id}"
+    url = f"https://places.googleapis.com/v1/{resource}"
     fields = ",".join([
-        "name","rating","user_ratings_total","formatted_address",
-        "formatted_phone_number","price_level","website","opening_hours","reviews"
+        "id",
+        "displayName",
+        "formattedAddress",
+        "location",
+        "rating",
+        "userRatingCount",
+        "priceLevel",
+        "nationalPhoneNumber",
+        "websiteUri",
+        "regularOpeningHours.weekdayDescriptions",
+        # "reviews",  # often restricted; uncomment if your project has access
     ])
-    params = gp_base_params() | {"place_id": place_id, "fields": fields}
-    r = requests.get(url, params=params, timeout=20)
+    headers = gp_headers(fields)
+    headers["X-Goog-Api-Key"] = GOOGLE_PLACES_API_KEY  # also acceptable for GET
+    r = requests.get(url, headers=headers, timeout=20)
     r.raise_for_status()
-    return r.json().get("result", {}) or {}
+    data = r.json()
+
+    name = (data.get("displayName") or {}).get("text", "")
+    loc = data.get("location") or {}
+    opening = (data.get("regularOpeningHours") or {}).get("weekdayDescriptions", [])
+    details = {
+        "name": name,
+        "rating": float(data.get("rating", 0) or 0),
+        "user_ratings_total": int(data.get("userRatingCount", 0) or 0),
+        "formatted_address": data.get("formattedAddress", ""),
+        "formatted_phone_number": data.get("nationalPhoneNumber", ""),
+        "price_level": data.get("priceLevel", None),
+        "website": data.get("websiteUri", ""),
+        "opening_hours": {"weekday_text": opening},
+        "reviews": data.get("reviews", []),
+    }
+    return details
 
 # --------------------------------------------------------------------
 # ARS client (inline)
@@ -208,10 +274,13 @@ with tab1:
     if st.button("Search"):
         try:
             df = search_competitors(term, city, state, zip_code, limit=limit)
-
             if df.empty:
-                st.warning(f"No results. Try broader terms or nearby locations. "
-                           f"(Google status: {getattr(df, '_search_status', 'UNKNOWN')})")
+                msg = getattr(df, "_search_status", "UNKNOWN")
+                em  = getattr(df, "_error_message", "")
+                if em:
+                    st.error(f"No results. Google said: {msg}. Error: {em}")
+                else:
+                    st.warning(f"No results. Try broader terms or nearby locations. (Google status: {msg})")
                 st.stop()
 
             # Filters
@@ -278,7 +347,7 @@ with tab1:
 
             # Details + Reviews
             st.markdown("---")
-            st.subheader("Place details & recent reviews")
+            st.subheader("Place details")
             name_choice = st.selectbox("Select a business", list(dff["Name"]))
             chosen = dff[dff["Name"] == name_choice].iloc[0]
             try:
@@ -296,15 +365,14 @@ with tab1:
                         for line in details["opening_hours"]["weekday_text"]:
                             st.write(line)
 
-                st.markdown("#### Recent reviews")
+                # reviews often restricted in v1 standard access, so we display if present
                 revs = details.get("reviews", []) or []
-                if not revs:
-                    st.info("No reviews available from Google for this place.")
-                else:
+                if revs:
+                    st.markdown("#### Recent reviews")
                     for r in revs:
-                        author = r.get("author_name","Anonymous")
+                        author = r.get("authorName","Anonymous")
                         rating = r.get("rating","?")
-                        when   = r.get("relative_time_description","")
+                        when   = r.get("relativePublishTimeDescription","")
                         st.markdown(f"**{author}** — {rating}★ — {when}")
                         st.write(r.get("text",""))
                         st.markdown("---")
@@ -314,7 +382,7 @@ with tab1:
         except Exception as e:
             st.error(f"Google Places error: {e}")
 
-    st.caption("Requires Places API and Geocoding API enabled. Key must be restricted to those APIs.")
+    st.caption("Requires Places API (New) and Geocoding API enabled. Key must be restricted to those APIs.")
 
 # --------------------------------------------------------------------
 # TAB 2 — ARS Lead Follow-Up (unchanged)
@@ -371,4 +439,4 @@ with tab2:
             st.error(f"ARS error: {e}")
 
 st.markdown("---")
-st.caption("Pulse © — Google Places competitor insights + private ARS follow-ups.")
+st.caption("Pulse © — Google Places (New) competitor insights + private ARS follow-ups.")
