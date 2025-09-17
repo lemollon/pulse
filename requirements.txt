@@ -13,3 +13,5 @@ uvicorn[standard]>=0.29.0
 
 # AI
 openai>=1.40.0
+# Word export
+python-docx>=0.8.11
