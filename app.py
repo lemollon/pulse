@@ -1,30 +1,30 @@
-# app.py — Pulse (Google Places API v1 + Folium map + ARS + AI + session-state + ARS shape fix + ARS health tester)
-import os
-import json
-import hmac
-import hashlib
+# app.py — Pulse (Google Places v1 + Folium + ARS + AI + TXT/DOCX export)
+import os, json, hmac, hashlib, time, re, textwrap, io
 import requests
 import datetime as dt
 import pandas as pd
 import altair as alt
 import streamlit as st
 
-# Folium map
+# Maps
 import folium
 from streamlit_folium import st_folium
+
+# DOCX export
+from docx import Document
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 st.set_page_config(page_title="Pulse — Google Places + ARS", page_icon="💼", layout="wide")
 st.title("💼 Pulse — Competitor Insights (Google Places) + ARS Follow-Up")
 
-# ---------------- Session defaults (persist search across reruns) ----------------
+# ---------------- Session defaults ----------------
 if "search_df" not in st.session_state:
     st.session_state.search_df = None
 if "search_inputs" not in st.session_state:
     st.session_state.search_inputs = {"term":"doughnut shop", "city":"Fulshear", "state":"TX", "zip_code":"77441", "limit":12}
 
-# --------------------------------------------------------------------
-# Secrets / Keys helpers
-# --------------------------------------------------------------------
+# ---------------- Secrets ----------------
 def get_secret(name: str, default: str = "") -> str:
     try:
         return st.secrets.get(name, os.getenv(name, default))
@@ -50,36 +50,25 @@ def llm_available() -> bool:
     return client is not None
 
 def llm(prompt: str, system: str = "You are a concise business analyst for local SMBs.") -> str:
-    """Small wrapper around Chat Completions; returns '' if unavailable."""
     if not llm_available():
         return ""
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt}
-            ],
+            messages=[{"role":"system","content":system},{"role":"user","content":prompt}],
             temperature=0.3,
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception as e:
         return f"(AI helper unavailable: {e})"
 
-# --------------------------------------------------------------------
-# Google Places (New, v1): Text Search -> fallback to Nearby via Geocode
-# --------------------------------------------------------------------
+# ---------------- Google Places (New, v1) ----------------
 def gp_headers(field_mask: str):
     if not GOOGLE_PLACES_API_KEY:
         raise RuntimeError("GOOGLE_PLACES_API_KEY not set.")
-    return {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-        "X-Goog-FieldMask": field_mask,
-    }
+    return {"Content-Type":"application/json","X-Goog-Api-Key":GOOGLE_PLACES_API_KEY,"X-Goog-FieldMask":field_mask}
 
 def geocode_location(city: str, state: str, zip_code: str):
-    """Geocode to get a lat/lng for Nearby fallback (uses Geocoding API)."""
     parts = []
     if city.strip(): parts.append(city.strip())
     if state.strip(): parts.append(state.strip())
@@ -99,15 +88,7 @@ def geocode_location(city: str, state: str, zip_code: str):
     return float(loc["lat"]), float(loc["lng"])
 
 def search_competitors(term: str, city: str, state: str, zip_code: str, limit: int = 12):
-    """
-    Places API (New):
-      1) /v1/places:searchText
-      2) Fallback: /v1/places:searchNearby around geocoded city/ZIP (15km)
-    Returns a DataFrame; attaches _search_status and _error_message for debugging.
-    """
     err_msg = ""
-
-    # -------- Text Search --------
     text_url = "https://places.googleapis.com/v1/places:searchText"
     loc_parts, q_parts = [], []
     if city.strip(): loc_parts.append(city.strip())
@@ -117,26 +98,19 @@ def search_competitors(term: str, city: str, state: str, zip_code: str, limit: i
         loc = f"{loc} {zip_code.strip()}" if loc else zip_code.strip()
     if term.strip(): q_parts.append(term.strip())
     query = f"{' '.join(q_parts)} in {loc}" if loc else (' '.join(q_parts) or "donut shop")
-
     text_body = {"textQuery": query, "maxResultCount": limit}
     text_fields = ",".join([
-        "places.id",
-        "places.displayName",
-        "places.formattedAddress",
-        "places.location",
-        "places.rating",
-        "places.userRatingCount",
-        "places.priceLevel",
+        "places.id","places.displayName","places.formattedAddress","places.location",
+        "places.rating","places.userRatingCount","places.priceLevel",
     ])
     rt = requests.post(text_url, headers=gp_headers(text_fields), json=text_body, timeout=20)
     rt.raise_for_status()
     jt = rt.json()
-    status = jt.get("status", "OK")  # v1 usually omits 'status' when OK
+    status = jt.get("status", "OK")
     if "error" in jt:
         err_msg = jt["error"].get("message", "")
     places = jt.get("places", []) or []
 
-    # -------- Fallback: Nearby --------
     if not places:
         geo = geocode_location(city, state, zip_code)
         if geo:
@@ -144,25 +118,12 @@ def search_competitors(term: str, city: str, state: str, zip_code: str, limit: i
             nearby_url = "https://places.googleapis.com/v1/places:searchNearby"
             nearby_body = {
                 "maxResultCount": limit,
-                "locationRestriction": {
-                    "circle": {
-                        "center": {"latitude": lat, "longitude": lng},
-                        "radius": 15000.0  # meters (15km)
-                    }
-                },
+                "locationRestriction": {"circle": {"center": {"latitude": lat, "longitude": lng}, "radius": 15000.0}},
                 "rankPreference": "RELEVANCE",
-                "includedTypes": ["bakery", "cafe"],  # sane defaults
+                "includedTypes": ["bakery","cafe"],
                 "keyword": term or "donut doughnut"
             }
-            nf = ",".join([
-                "places.id",
-                "places.displayName",
-                "places.formattedAddress",
-                "places.location",
-                "places.rating",
-                "places.userRatingCount",
-                "places.priceLevel",
-            ])
+            nf = text_fields
             rn = requests.post(nearby_url, headers=gp_headers(nf), json=nearby_body, timeout=20)
             rn.raise_for_status()
             jn = rn.json()
@@ -171,19 +132,18 @@ def search_competitors(term: str, city: str, state: str, zip_code: str, limit: i
             status = f"{status} -> Nearby:{'OK' if 'error' not in jn else 'ERROR'}"
             places = jn.get("places", []) or []
 
-    # -------- Normalize to DataFrame --------
     out = []
     for p in places[:limit]:
         name = ((p.get("displayName") or {}).get("text")) or p.get("name","").split("/")[-1]
-        loc = p.get("location") or {}
+        locd = p.get("location") or {}
         out.append({
             "Name": name,
             "Rating": float(p.get("rating", 0) or 0),
             "Reviews": int(p.get("userRatingCount", 0) or 0),
             "Address": p.get("formattedAddress", ""),
             "PriceLevel": p.get("priceLevel", None),
-            "Lat": loc.get("latitude", None),
-            "Lng": loc.get("longitude", None),
+            "Lat": locd.get("latitude", None),
+            "Lng": locd.get("longitude", None),
             "PlaceID": p.get("id", p.get("name","").split("/")[-1]),
         })
     df = pd.DataFrame(out)
@@ -192,13 +152,11 @@ def search_competitors(term: str, city: str, state: str, zip_code: str, limit: i
     return df
 
 def get_place_details(place_id: str):
-    """Places API (New) details call. GET /v1/places/{place_id}"""
     resource = place_id if place_id.startswith("places/") else f"places/{place_id}"
     url = f"https://places.googleapis.com/v1/{resource}"
     fields = ",".join([
         "id","displayName","formattedAddress","location","rating","userRatingCount",
         "priceLevel","nationalPhoneNumber","websiteUri","regularOpeningHours.weekdayDescriptions"
-        # "reviews",  # often restricted; include if your access allows
     ])
     headers = gp_headers(fields)
     headers["X-Goog-Api-Key"] = GOOGLE_PLACES_API_KEY
@@ -207,7 +165,7 @@ def get_place_details(place_id: str):
     data = r.json()
     name = (data.get("displayName") or {}).get("text", "")
     opening = (data.get("regularOpeningHours") or {}).get("weekdayDescriptions", [])
-    details = {
+    return {
         "name": name,
         "rating": float(data.get("rating", 0) or 0),
         "user_ratings_total": int(data.get("userRatingCount", 0) or 0),
@@ -218,52 +176,31 @@ def get_place_details(place_id: str):
         "opening_hours": {"weekday_text": opening},
         "reviews": data.get("reviews", []),
     }
-    return details
 
-# --------------------------------------------------------------------
-# ARS client (inline) — robust to different response shapes
-# --------------------------------------------------------------------
+# ---------------- ARS client + health ----------------
 def sign_payload(body_bytes: bytes) -> str:
     return hmac.new(ARS_SECRET, body_bytes, hashlib.sha256).hexdigest()
 
 def _normalize_ars_steps(obj):
-    """
-    Accepts either:
-      - {"arm": "...", "score": 0.9, "steps": [ ... ]}
-      - [ {...}, {...}, {...} ]  (raw list)
-    Returns: (arm, score, steps_list)
-    """
     arm, score, steps = None, None, []
     if isinstance(obj, dict):
         arm = obj.get("arm")
         score = obj.get("score")
         raw = obj.get("steps", obj.get("plan", obj.get("data", [])))
-        if isinstance(raw, list):
-            steps = raw
-        elif isinstance(raw, dict) and "steps" in raw and isinstance(raw["steps"], list):
-            steps = raw["steps"]
+        if isinstance(raw, list): steps = raw
+        elif isinstance(raw, dict) and "steps" in raw and isinstance(raw["steps"], list): steps = raw["steps"]
     elif isinstance(obj, list):
         steps = obj
-    # Normalize each step
     normed = []
     for s in steps:
-        if not isinstance(s, dict):
-            continue
+        if not isinstance(s, dict): continue
         send_dt = s.get("send_dt") or s.get("date") or s.get("when") or ""
         channel = (s.get("channel") or "").lower() or "email"
         subject = s.get("subject", "")
         body = s.get("body", "")
-        # Provide defaults where helpful
-        if channel == "sms" and not subject:
-            subject = ""
-        if channel == "email" and not subject:
-            subject = "Quick follow-up"
-        normed.append({
-            "send_dt": str(send_dt),
-            "channel": channel,
-            "subject": subject,
-            "body": body
-        })
+        if channel == "sms" and not subject: subject = ""
+        if channel == "email" and not subject: subject = "Quick follow-up"
+        normed.append({"send_dt": str(send_dt), "channel": channel, "subject": subject, "body": body})
     return arm, score, normed
 
 def plan_with_ars(lead: dict, context: dict, cohort: str = "donut_shop") -> dict:
@@ -275,38 +212,111 @@ def plan_with_ars(lead: dict, context: dict, cohort: str = "donut_shop") -> dict
             ARS_URL,
             headers={"x-signature": sig, "Content-Type": "application/json"},
             data=body,
-            timeout=30
+            timeout=45
         )
-        # Don't raise immediately: we want helpful message content if any
         text = r.text
         if not r.ok:
-            # Bubble up body for debugging
             raise RuntimeError(f"ARS HTTP {r.status_code}: {text[:500]}")
         try:
             data = r.json()
         except Exception:
-            try:
-                data = json.loads(text)
-            except Exception:
-                raise RuntimeError(f"ARS returned non-JSON: {text[:500]}")
+            data = json.loads(text)
         arm, score, steps = _normalize_ars_steps(data)
         return {"arm": arm, "score": score, "steps": steps, "_raw": data}
     except Exception as e:
         raise RuntimeError(f"ARS request failed: {e}")
 
-# --------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------
+def ars_health_check(url: str, tries: int = 6, base_timeout: float = 10.0) -> tuple[int, str]:
+    health_url = url.replace("/ars/plan", "/healthz")
+    timeout = base_timeout
+    for i in range(1, tries+1):
+        try:
+            resp = requests.get(health_url, timeout=timeout)
+            return resp.status_code, resp.text[:500] if resp.text else "<no body>"
+        except Exception as e:
+            if i == tries:
+                return 0, f"Health check failed after {tries} tries: {e}"
+            time.sleep(5)
+            timeout += 5
+    return 0, "unknown error"
+
+# ---------------- AI polish helpers (force no JSON) ----------------
+def strip_code_fences(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    s = s.strip()
+    if s.startswith("```"):
+        s = s[3:]
+        s = re.sub(r'^(json|JSON|python|txt)\s*\n', '', s, count=1)
+        if "```" in s:
+            s = s.split("```", 1)[0]
+    return s.strip()
+
+def steps_to_markdown(steps):
+    lines = []
+    for step in steps:
+        dtv = step.get("send_dt","")
+        ch = (step.get("channel","") or "").title()
+        subject = step.get("subject","")
+        body = (step.get("body","") or "").strip()
+        header = f"📅 **{dtv} — {ch}**"
+        if ch.lower() == "email" and subject:
+            lines += [header, f"**Subject:** {subject}", body, ""]
+        else:
+            lines += [header, body, ""]
+    return "\n".join(lines).strip()
+
+def coerce_polished_to_markdown(raw_text: str, fallback_steps):
+    cleaned = strip_code_fences(raw_text or "")
+    try:
+        obj = json.loads(cleaned)
+        if isinstance(obj, list):
+            return steps_to_markdown(obj)
+        if isinstance(obj, dict) and "steps" in obj and isinstance(obj["steps"], list):
+            return steps_to_markdown(obj["steps"])
+    except Exception:
+        pass
+    if cleaned:
+        return cleaned
+    return steps_to_markdown(fallback_steps)
+
+def build_txt_bytes(title: str, body_md: str) -> bytes:
+    text = f"{title}\n\n{body_md}"
+    return textwrap.dedent(text).encode("utf-8")
+
+def build_docx_bytes(title: str, body_md: str) -> bytes:
+    doc = Document()
+    # Title
+    t = doc.add_heading(title, level=1)
+    t.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    # Convert simple markdown-ish sections
+    for block in body_md.split("\n\n"):
+        if block.strip().startswith("📅"):
+            p = doc.add_paragraph()
+            run = p.add_run(block.strip())
+            run.bold = True
+        elif block.strip().startswith("**Subject:**"):
+            p = doc.add_paragraph()
+            run = p.add_run(block.replace("**Subject:**", "Subject:").strip())
+            run.bold = True
+        else:
+            doc.add_paragraph(block.strip())
+    # Bytes
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+# ---------------- Helpers ----------------
 def opportunity_score(row):
     rating  = float(row["Rating"] or 0)
     reviews = int(row["Reviews"] or 0)
-    base = max(0.0, 5.0 - rating)                      # lower rating => higher base opportunity
+    base = max(0.0, 5.0 - rating)
     big_player = 1.0 if (reviews >= 300 and rating < 4.2) else 0.0
     sleeper    = 1.0 if (reviews < 60 and rating >= 4.5) else 0.0
     return round(base + 1.5*big_player + 0.8*sleeper, 2)
 
 def render_folium_map(df):
-    """Clickable map with tooltips & popups: Name, Rating, Reviews, Address."""
     dfc = df.dropna(subset=["Lat","Lng"]).copy()
     if dfc.empty:
         st.info("No coordinates available to plot.")
@@ -349,18 +359,14 @@ def build_insights_md(query_term, query_city, query_state, df_view, opp_view, pl
     lines += ["", "— Generated by Pulse"]
     return "\n".join(lines)
 
-# --------------------------------------------------------------------
-# Tabs
-# --------------------------------------------------------------------
+# ---------------- UI ----------------
 tab1, tab2 = st.tabs(["⭐ Competitor Watch (Google)", "📬 Lead Follow-Up (ARS)"])
 
-# ========================= TAB 1 ===========================
+# ===== TAB 1 =====
 with tab1:
     st.subheader("Find similar businesses via Google Places")
-    st.info("**How this page uses AI:** We use Google Places data for facts (ratings, reviews, locations). "
-            "If an OpenAI key is provided, AI summarizes the market, suggests quick wins, and builds a mini playbook.")
+    st.info("**How this page uses AI:** Google Places provides facts; optional AI summarizes and suggests quick wins.")
 
-    # --------- Input form (persisted via session_state) ----------
     with st.form("search_form"):
         inputs = st.session_state.search_inputs
         col1, col2, col3 = st.columns([1.2,1,1])
@@ -374,15 +380,11 @@ with tab1:
         limit = st.slider("How many competitors?", 3, 25, inputs.get("limit", 12))
         submitted = st.form_submit_button("Search")
 
-    # Clear button
-    clear_col, _ = st.columns([1,3])
-    with clear_col:
-        if st.button("Clear results"):
-            st.session_state.search_df = None
-            st.session_state.search_inputs = {"term":"doughnut shop", "city":"Fulshear", "state":"TX", "zip_code":"77441", "limit":12}
-            st.experimental_rerun()
+    if st.button("Clear results"):
+        st.session_state.search_df = None
+        st.session_state.search_inputs = {"term":"doughnut shop", "city":"Fulshear", "state":"TX", "zip_code":"77441", "limit":12}
+        st.experimental_rerun()
 
-    # Run search only on submit; persist results & inputs
     if submitted:
         try:
             df = search_competitors(term, city, state, zip_code, limit=limit)
@@ -401,14 +403,12 @@ with tab1:
             st.error(f"Google Places error: {e}")
             st.session_state.search_df = None
 
-    # Always read from session from here on
     df = st.session_state.search_df
     inputs = st.session_state.search_inputs
     if df is None:
         st.info("Enter a search and press **Search** to see competitors.")
         st.stop()
 
-    # ------------------------ Filters ------------------------
     f1, f2, f3 = st.columns(3)
     with f1:
         min_reviews = st.slider("Min reviews", 0, int(df["Reviews"].max() or 0), 10, step=5)
@@ -420,23 +420,16 @@ with tab1:
     dff = df[(df["Reviews"] >= min_reviews) & (df["Rating"] >= min_rating)].copy()
     dff = dff.sort_values(["Reviews","Rating"], ascending=[False, False]).head(top_n)
 
-    # ------------------------ KPIs ------------------------
     k1,k2,k3 = st.columns(3)
     k1.metric("Shown", len(dff))
     k2.metric("Avg rating", f"{dff['Rating'].mean():.2f}" if len(dff) else "–")
     k3.metric("Median reviews", int(dff["Reviews"].median() if len(dff) else 0))
 
-    # ------------------------ Map ------------------------
     st.markdown("### Map of competitors")
-    st.caption("**What this is:** A real map of similar businesses near your search area.\n\n"
-               "**How to use it:** Hover or click a pin to see name, rating, reviews, and address. "
-               "Zoom to find clusters (e.g., office parks, commuter routes).")
+    st.caption("Hover/click pins to see name, rating, reviews, and address.")
     render_folium_map(dff)
 
-    # ------------------------ Charts — Bar ------------------------
-    st.markdown("### Top 10 by reviews — *Local awareness leaderboard*")
-    st.caption("**What this is:** Bars sorted by total public review count (a proxy for foot traffic/awareness). \n"
-               "**How to use it:** The top bars are the loudest competitors; copy what works or target their weak hours.")
+    st.markdown("### Top 10 by reviews")
     if not dff.empty:
         bar = (
             alt.Chart(dff.sort_values(["Reviews","Rating"], ascending=[False,False]).head(10))
@@ -448,10 +441,7 @@ with tab1:
         )
         st.altair_chart(bar, use_container_width=True)
 
-    # ------------------------ Charts — Scatter ------------------------
-    st.markdown("### Rating vs. Review Volume — *Who’s loved vs. who’s loud*")
-    st.caption("**What this is:** Each dot is a business. X = total reviews (awareness), Y = average rating (satisfaction).\n"
-               "**How to use it:** High-reviews + low-rating = big player with weaknesses → win customers with better service/promos.")
+    st.markdown("### Rating vs. Review Volume")
     if not dff.empty:
         scatter = (
             alt.Chart(dff)
@@ -464,138 +454,34 @@ with tab1:
         )
         st.altair_chart(scatter, use_container_width=True)
 
-    # ------------------------ AI Market Summary ------------------------
     if llm_available() and not dff.empty:
         sample_rows = dff.head(12)[["Name","Rating","Reviews","Address"]].to_dict(orient="records")
         prompt = (
-            "You are analyzing a local market for a small business owner.\n"
-            "Given this list of competitors (name, rating, reviews, address), summarize "
-            "1) what the market looks like, and 2) two quick wins they can test this week. "
-            f"Competitors JSON:\n{json.dumps(sample_rows)}"
+            "Summarize the local market and list two quick wins a donut shop can test this week.\n"
+            f"Data:\n{json.dumps(sample_rows)}"
         )
         st.markdown("### AI Market Summary")
         st.info(llm(prompt))
     else:
-        st.caption("Tip: add `OPENAI_API_KEY` in Secrets to get AI summaries and suggested actions.")
+        st.caption("Tip: add `OPENAI_API_KEY` in Secrets to get AI summaries and actions.")
 
-    # ------------------------ Opportunity Finder ------------------------
-    st.markdown("### 🔎 Opportunity Finder")
-    st.caption(
-        "**What this is:** A ranked list of where you can steal share quickly.\n"
-        "- **Opportunity** = (5 − rating) + bonus if they’re big but weak, "
-        "or if there’s a sleeper with great rating but low visibility.\n"
-        "**How to use it:** Start at the top row; run the suggested action for 7 days and measure results."
-    )
-    opp = None
-    if not dff.empty:
-        dff["Opportunity"] = dff.apply(opportunity_score, axis=1)
-        opp = dff.sort_values("Opportunity", ascending=False)[
-            ["Name","Rating","Reviews","Opportunity","Address"]
-        ].head(5).copy()
-
-        # LLM suggested actions
-        if llm_available():
-            actions = []
-            for row in opp.to_dict(orient="records"):
-                prompt = (
-                    "Suggest one high-ROI, low-lift action a donut shop could take to win customers "
-                    "from this competitor within 7 days. Keep it to 1–2 sentences, concrete and testable.\n"
-                    f"Competitor: {json.dumps(row)}"
-                )
-                actions.append(llm(prompt, system="You are a scrappy local growth marketer."))
-            opp["Suggested Action"] = actions
-        else:
-            opp["Suggested Action"] = "Add OPENAI_API_KEY to see tailored actions."
-
-        st.dataframe(opp, use_container_width=True)
-
-    # ------------------------ Owner Playbook (AI) ------------------------
-    playbook_text = ""
-    if llm_available() and not dff.empty:
-        pb_prompt = (
-            "Create a short 5-bullet playbook for a donut shop to grow sales in the next 14 days, "
-            "based on these competitors (name, rating, reviews, address). Be practical and specific.\n"
-            f"Data:\n{json.dumps(dff.head(12).to_dict(orient='records'))}"
-        )
-        st.markdown("### Owner Playbook (AI)")
-        playbook_text = llm(pb_prompt, system="You are a practical small-business growth strategist.")
-        st.info(playbook_text)
-
-    # ------------------------ Details (single place) ------------------------
-    st.markdown("---")
-    st.subheader("Place details")
-    name_choice = st.selectbox("Select a business", list(dff["Name"]))
-    chosen = dff[dff["Name"] == name_choice].iloc[0]
-    try:
-        details = get_place_details(chosen["PlaceID"])
-        st.write(f"**{details.get('name','')}**")
-        st.write(details.get("formatted_address",""))
-        phone = details.get("formatted_phone_number","")
-        if phone: st.write(phone)
-        st.write(f"Rating: **{details.get('rating',0)}** ({details.get('user_ratings_total',0)} reviews)")
-        site = details.get("website","")
-        if site: st.write(site)
-
-        if (details.get("opening_hours") or {}).get("weekday_text"):
-            with st.expander("Opening hours"):
-                for line in details["opening_hours"]["weekday_text"]:
-                    st.write(line)
-
-        # Optional AI: summarize reviews if present
-        revs = details.get("reviews", []) or []
-        if llm_available() and revs:
-            texts = [r.get("text","") for r in revs if r.get("text")]
-            if texts:
-                prompt = (
-                    "From these customer review snippets, extract:\n"
-                    "1) Top 3 things customers love\n2) Top 3 friction points\n"
-                    "Be brief and specific.\n\n"
-                    f"Reviews:\n{json.dumps(texts[:12])}"
-                )
-                st.markdown("#### AI summary — what customers love vs. where they struggle")
-                st.info(llm(prompt))
-    except Exception as e:
-        st.error(f"Details error: {e}")
-
-    # ------------------------ Export Insights.md ------------------------
-    insights_md = build_insights_md(
-        inputs.get("term","doughnut shop"),
-        inputs.get("city",""),
-        inputs.get("state",""),
-        dff, opp, playbook_text=playbook_text
-    )
-    st.download_button("⬇️ Download Insights.md", insights_md.encode("utf-8"),
-                       "insights.md", "text/markdown")
-
-    st.caption("Requires **Places API (New)** and **Geocoding API** enabled. "
-               "API key: Application restrictions = None; API restrictions = Places API (New) + Geocoding API.")
-
-# ========================= TAB 2 ===========================
+# ===== TAB 2 =====
 with tab2:
     st.subheader("Generate a 3-step follow-up plan using your private ARS backend")
-    with st.expander("What is ARS and why it helps"):
-        st.write(
-            "- **ARS = Adaptive Revenue Sequencer.** It picks a 3-step follow-up plan "
-            "(channels, timing, copy) that maximizes replies.\n"
-            "- Under the hood: constraint-aware scoring + a **multi-armed bandit (UCB)** to learn over time.\n"
-            "- Result: better response rates without guesswork."
-        )
-    st.info("**How this page uses AI:** ARS scores features (timing, channel preference, sentiment) "
-            "and uses a bandit algorithm to explore what works. As you feed outcomes later (replied/booked), "
-            "it will adapt sequences to your market.")
+    st.info("ARS picks channels/timing and learns over time; AI polishes the copy.")
 
-    # --------- Quick ARS connectivity test ----------
-    test_col, _ = st.columns([1,3])
-    with test_col:
-        if st.button("Test ARS health"):
-            try:
-                health_url = ARS_URL.replace("/ars/plan", "/healthz")
-                resp = requests.get(health_url, timeout=10)
-                st.write("Health status:", resp.status_code)
-                st.code(resp.text[:200] if resp.text else "<no body>")
-            except Exception as e:
-                st.error(f"Health check failed: {e}")
+    # Sidebar diagnostics
+    st.sidebar.header("⚙️ Diagnostics")
+    if st.sidebar.button("Test ARS connection"):
+        try:
+            lead = {"name":"Test","contact":"test@example.com"}
+            context = {"today": str(dt.date.today()), "hour_local": dt.datetime.now().hour, "weekend": False}
+            result = plan_with_ars(lead, context, cohort="diagnostic")
+            st.sidebar.success(f"ARS OK — got {len(result.get('steps', []))} steps")
+        except Exception as e:
+            st.sidebar.error(f"ARS error: {e}")
 
+    # Inputs
     colA, colB = st.columns(2)
     with colA:
         lead_name = st.text_input("Lead name", "Jane Smith")
@@ -635,44 +521,46 @@ with tab2:
             for step in steps:
                 subj = step.get("subject", "")
                 subj_str = f"— {subj}" if subj else ""
-                st.markdown(
-                    f"📅 **{step.get('send_dt','')}** — *{step.get('channel','')}* {subj_str}"
-                )
+                st.markdown(f"📅 **{step.get('send_dt','')}** — *{step.get('channel','')}* {subj_str}")
                 st.write(step.get("body",""))
                 st.markdown("---")
 
-            # Explain *why* this plan (simple heuristics)
-            reasons = []
-            if pref == "sms":
-                reasons.append("Lead prefers SMS, so we start or include SMS early.")
-            hour_now = dt.datetime.now().hour
-            if 8 <= hour_now <= 11:
-                reasons.append("Morning window is strong for food orders and office pickups.")
-            if float(avg_sent7) >= 0.1:
-                reasons.append("Recent sentiment is positive; light, friendly tone increases replies.")
-            if float(wait_iss) > 0:
-                reasons.append("Some wait-time complaints—include pre-order/pickup link.")
-            if not reasons:
-                reasons = ["Balanced plan chosen to learn what works fastest."]
-            st.markdown("#### Why we chose this plan")
-            st.write("\n".join([f"- {r}" for r in reasons]))
-
-            # 🔥 AI-polish the copy (if key present)
+            # AI-polish — force plain text; post-process any JSON
+            polished_text = ""
             if llm_available() and steps:
                 polish_prompt = (
-                    "Polish these 3 follow-up steps for a friendly donut shop brand. "
-                    "Keep messages short, warm, and action-oriented. Keep dates and channels but improve subject/body. "
+                    "Rewrite the following follow-up steps for a friendly donut shop brand.\n"
+                    "- Keep the SAME send dates and channels.\n"
+                    "- Improve subject/body to be warm, concise, and action-oriented.\n"
+                    "- RETURN ONLY PLAIN TEXT MARKDOWN with three sections.\n"
+                    "- Each section begins: '📅 <date> — <Channel>'\n"
+                    "- If channel is email, include a 'Subject:' line next, then the body.\n"
+                    "- Do NOT output JSON. Do NOT use code fences.\n\n"
                     f"Steps JSON:\n{json.dumps(steps)}"
                 )
+                raw_polished = llm(polish_prompt, system="You write warm, high-converting SMB follow-ups. Output plain text only.")
+                polished_text = coerce_polished_to_markdown(raw_polished, steps)
                 st.markdown("### AI-Polished Copy")
-                polished = llm(polish_prompt, system="You write warm, high-converting SMB follow-up messages.")
-                st.info(polished)
+                st.markdown(polished_text)
+            else:
+                polished_text = steps_to_markdown(steps)
 
-            st.download_button("⬇️ Export follow-ups (CSV)",
-                               pd.DataFrame(steps).to_csv(index=False).encode(),
-                               "followups.csv", "text/csv")
+            # Downloads: TXT + DOCX
+            st.download_button(
+                "⬇️ Download polished plan (TXT)",
+                build_txt_bytes("Polished Follow-Up Plan", polished_text),
+                "polished_followup.txt",
+                "text/plain"
+            )
+            st.download_button(
+                "⬇️ Download polished plan (DOCX)",
+                build_docx_bytes("Polished Follow-Up Plan", polished_text),
+                "polished_followup.docx",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+
         except Exception as e:
             st.error(f"ARS error: {e}")
 
 st.markdown("---")
-st.caption("Pulse © — Google Places (New) competitor insights + private ARS follow-ups.")
+st.caption("Pulse © — Google Places (New) competitor insights + private ARS follow-ups. Exports: TXT/DOCX.")
