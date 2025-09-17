@@ -30,43 +30,98 @@ if not GOOGLE_PLACES_API_KEY:
     st.warning("Missing GOOGLE_PLACES_API_KEY. Add it in Streamlit Secrets to enable Google Places search.")
 
 # --------------------------------------------------------------------
-# Google Places (inline client)
+# Google Places (robust: Text Search -> fallback to Nearby via Geocode)
 # --------------------------------------------------------------------
 def gp_base_params():
     if not GOOGLE_PLACES_API_KEY:
         raise RuntimeError("GOOGLE_PLACES_API_KEY not set.")
     return {"key": GOOGLE_PLACES_API_KEY}
 
-def build_query(term: str, city: str, state: str, zip_code: str) -> str:
-    parts = []
-    if city.strip(): parts.append(city.strip())
-    if state.strip(): parts.append(state.strip())
-    loc = ", ".join(parts)
+def geocode_location(city: str, state: str, zip_code: str):
+    """
+    Turn 'Fulshear, TX 77441' into lat/lng using the Geocoding API.
+    NOTE: Enable 'Geocoding API' in Google Cloud and include it in key restrictions.
+    """
+    address_parts = []
+    if city.strip(): address_parts.append(city.strip())
+    if state.strip(): address_parts.append(state.strip())
+    address = ", ".join(address_parts)
     if zip_code.strip():
-        loc = f"{loc} {zip_code.strip()}" if loc else zip_code.strip()
-    return f"{term} in {loc}" if loc else term
+        address = f"{address} {zip_code.strip()}" if address else zip_code.strip()
+    if not address:
+        return None
 
-def search_competitors(term: str, city: str, state: str, zip_code: str, limit: int = 12):
-    url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-    q = build_query(term, city, state, zip_code)
-    params = gp_base_params() | {"query": q}
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    params = gp_base_params() | {"address": address}
     r = requests.get(url, params=params, timeout=20)
     r.raise_for_status()
-    results = r.json().get("results", [])
+    data = r.json()
+    status = data.get("status")
+    if status != "OK":
+        return None
+    loc = data["results"][0]["geometry"]["location"]
+    return float(loc["lat"]), float(loc["lng"])
+
+def search_competitors(term: str, city: str, state: str, zip_code: str, limit: int = 12):
+    """
+    1) Text Search (broad, natural language)
+    2) If zero results: Nearby Search around geocoded city/ZIP (radius 15km) with keyword
+    Returns a DataFrame with normalized fields and attaches _search_status for debugging.
+    """
+    # --- Try Text Search ---
+    text_url = "https://maps.googleapis.com/maps/api/place/textsearch/json"
+    q_parts = []
+    if term.strip(): q_parts.append(term.strip())
+    loc_parts = []
+    if city.strip(): loc_parts.append(city.strip())
+    if state.strip(): loc_parts.append(state.strip())
+    loc = ", ".join(loc_parts)
+    if zip_code.strip():
+        loc = f"{loc} {zip_code.strip()}" if loc else zip_code.strip()
+    query = f"{' '.join(q_parts)} in {loc}" if loc else ' '.join(q_parts) or "donut shop"
+    text_params = gp_base_params() | {"query": query}
+
+    r = requests.get(text_url, params=text_params, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    status = j.get("status", "UNKNOWN")
+    use_results = j.get("results", [])[:limit]
+
+    # --- Fallback: Nearby around geocoded coordinates ---
+    if not use_results:
+        geo = geocode_location(city, state, zip_code)
+        if geo:
+            lat, lng = geo
+            nearby_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+            nearby_params = gp_base_params() | {
+                "location": f"{lat},{lng}",
+                "radius": 15000,  # 15km
+                "keyword": term or "donut doughnut",
+                # Optional: "type": "bakery",
+            }
+            rn = requests.get(nearby_url, params=nearby_params, timeout=20)
+            rn.raise_for_status()
+            jn = rn.json()
+            status = f"{status} -> Nearby:{jn.get('status','UNKNOWN')}"
+            use_results = jn.get("results", [])[:limit]
+
+    # Normalize
     out = []
-    for p in results[:limit]:
-        loc = (p.get("geometry") or {}).get("location") or {}
+    for p in use_results:
+        loc2 = (p.get("geometry") or {}).get("location") or {}
         out.append({
             "Name": p.get("name", ""),
             "Rating": float(p.get("rating", 0) or 0),
             "Reviews": int(p.get("user_ratings_total", 0) or 0),
-            "Address": p.get("formatted_address", ""),
+            "Address": p.get("formatted_address", p.get("vicinity", "")),
             "PriceLevel": p.get("price_level", None),
-            "Lat": loc.get("lat", None),
-            "Lng": loc.get("lng", None),
+            "Lat": loc2.get("lat", None),
+            "Lng": loc2.get("lng", None),
             "PlaceID": p.get("place_id", "")
         })
-    return pd.DataFrame(out)
+    df = pd.DataFrame(out)
+    df._search_status = status
+    return df
 
 def get_place_details(place_id: str):
     url = "https://maps.googleapis.com/maps/api/place/details/json"
@@ -121,16 +176,16 @@ def map_layer(df):
         if r >= 4.2: return [76,175,80]
         if r >= 3.8: return [255,193,7]
         return [244,67,54]
-
     plot_df = df[["Name","Rating","Reviews","Lat","Lng"]].dropna().copy()
-    if plot_df.empty:
-        return None
+    if plot_df.empty: return None
     plot_df["color"] = plot_df["Rating"].apply(color_for_rating)
-    plot_df["size"] = plot_df["Reviews"].clip(lower=1).apply(lambda x: min(60, 10 + (x**0.5)*3))
+    plot_df["size"]  = plot_df["Reviews"].clip(lower=1).apply(lambda x: min(60, 10 + (x**0.5)*3))
     layer = pdk.Layer("ScatterplotLayer", data=plot_df, get_position='[Lng, Lat]',
                       get_fill_color='color', get_radius='size', pickable=True)
-    view_state = pdk.ViewState(latitude=float(plot_df["Lat"].mean()), longitude=float(plot_df["Lng"].mean()), zoom=11)
-    return pdk.Deck(map_style="mapbox://styles/mapbox/light-v9", layers=[layer], initial_view_state=view_state,
+    view_state = pdk.ViewState(latitude=float(plot_df["Lat"].mean()),
+                               longitude=float(plot_df["Lng"].mean()), zoom=11)
+    return pdk.Deck(map_style="mapbox://styles/mapbox/light-v9", layers=[layer],
+                    initial_view_state=view_state,
                     tooltip={"text":"{Name}\nRating: {Rating}★  Reviews: {Reviews}"})
 
 # --------------------------------------------------------------------
@@ -144,113 +199,126 @@ with tab1:
     with col1:
         term = st.text_input("Category/term", "doughnut shop")
     with col2:
-        city = st.text_input("City", "Austin")
+        city = st.text_input("City", "Fulshear")
         state = st.text_input("State (2-letter)", "TX", max_chars=2)
     with col3:
-        zip_code = st.text_input("ZIP (optional)", "")
+        zip_code = st.text_input("ZIP (optional)", "77441")
     limit = st.slider("How many competitors?", 3, 25, 12)
 
     if st.button("Search"):
         try:
             df = search_competitors(term, city, state, zip_code, limit=limit)
+
             if df.empty:
-                st.warning("No results. Try broader terms or nearby locations.")
-            else:
-                f1, f2, f3 = st.columns(3)
-                with f1:
-                    min_reviews = st.slider("Min reviews", 0, int(df["Reviews"].max() or 0), 10, step=5)
-                with f2:
-                    min_rating  = st.slider("Min rating", 0.0, 5.0, 3.5, step=0.1)
-                with f3:
-                    top_n = st.slider("Show top N by reviews", 3, min(20, len(df)), min(10, len(df)))
+                st.warning(f"No results. Try broader terms or nearby locations. "
+                           f"(Google status: {getattr(df, '_search_status', 'UNKNOWN')})")
+                st.stop()
 
-                dff = df[(df["Reviews"] >= min_reviews) & (df["Rating"] >= min_rating)].copy()
-                dff = dff.sort_values(["Reviews","Rating"], ascending=[False, False]).head(top_n)
+            # Filters
+            f1, f2, f3 = st.columns(3)
+            with f1:
+                min_reviews = st.slider("Min reviews", 0, int(df["Reviews"].max() or 0), 10, step=5)
+            with f2:
+                min_rating  = st.slider("Min rating", 0.0, 5.0, 3.5, step=0.1)
+            with f3:
+                top_n       = st.slider("Show top N by reviews", 3, min(20, len(df)), min(10, len(df)))
 
-                k1,k2,k3 = st.columns(3)
-                k1.metric("Shown", len(dff))
-                k2.metric("Avg rating", f"{dff['Rating'].mean():.2f}" if len(dff) else "–")
-                k3.metric("Median reviews", int(dff["Reviews"].median() if len(dff) else 0))
+            dff = df[(df["Reviews"] >= min_reviews) & (df["Rating"] >= min_rating)].copy()
+            dff = dff.sort_values(["Reviews","Rating"], ascending=[False, False]).head(top_n)
 
-                st.markdown("### Map of competitors")
-                deck = map_layer(dff)
-                if deck: st.pydeck_chart(deck)
-                else: st.info("No coordinates available to plot.")
+            # KPIs
+            k1,k2,k3 = st.columns(3)
+            k1.metric("Shown", len(dff))
+            k2.metric("Avg rating", f"{dff['Rating'].mean():.2f}" if len(dff) else "–")
+            k3.metric("Median reviews", int(dff["Reviews"].median() if len(dff) else 0))
 
-                st.markdown("### Visualizations")
-                c1, c2 = st.columns(2)
-                if not dff.empty:
-                    bar = (
-                        alt.Chart(dff.sort_values(["Reviews","Rating"], ascending=[False,False]).head(10))
-                        .mark_bar()
-                        .encode(x=alt.X("Name:N", sort='-y', title="Business"),
-                                y=alt.Y("Rating:Q", title="Rating"),
-                                tooltip=["Name","Rating","Reviews"])
-                        .properties(height=350)
-                    )
-                    c1.altair_chart(bar, use_container_width=True)
+            # Map
+            st.markdown("### Map of competitors")
+            deck = map_layer(dff)
+            if deck: st.pydeck_chart(deck)
+            else: st.info("No coordinates available to plot.")
 
-                    scatter = (
-                        alt.Chart(dff)
-                        .mark_circle(size=80)
-                        .encode(x=alt.X("Reviews:Q", title="Review count"),
-                                y=alt.Y("Rating:Q", title="Rating"),
-                                tooltip=["Name","Rating","Reviews","Address"])
-                        .interactive()
-                        .properties(height=350)
-                    )
-                    c2.altair_chart(scatter, use_container_width=True)
+            # Charts
+            st.markdown("### Visualizations")
+            c1, c2 = st.columns(2)
+            if not dff.empty:
+                bar = (
+                    alt.Chart(dff.sort_values(["Reviews","Rating"], ascending=[False,False]).head(10))
+                    .mark_bar()
+                    .encode(x=alt.X("Name:N", sort='-y', title="Business"),
+                            y=alt.Y("Rating:Q", title="Rating"),
+                            tooltip=["Name","Rating","Reviews"])
+                    .properties(height=350)
+                )
+                c1.altair_chart(bar, use_container_width=True)
 
-                st.markdown("### 🔎 Opportunity Finder")
-                if not dff.empty:
-                    dff["Opportunity"] = dff.apply(opportunity_score, axis=1)
-                    opp = dff.sort_values("Opportunity", ascending=False)[["Name","Rating","Reviews","Opportunity","Address"]].head(5)
-                    st.dataframe(opp, use_container_width=True)
+                scatter = (
+                    alt.Chart(dff)
+                    .mark_circle(size=80)
+                    .encode(x=alt.X("Reviews:Q", title="Review count"),
+                            y=alt.Y("Rating:Q", title="Rating"),
+                            tooltip=["Name","Rating","Reviews","Address"])
+                    .interactive()
+                    .properties(height=350)
+                )
+                c2.altair_chart(scatter, use_container_width=True)
 
-                st.markdown("### Competitor list (filtered)")
-                st.dataframe(dff, use_container_width=True)
-                st.download_button("⬇️ Export filtered CSV", dff.to_csv(index=False).encode(),
-                                   "competitors_filtered.csv", "text/csv")
+            # Opportunity Finder
+            st.markdown("### 🔎 Opportunity Finder")
+            if not dff.empty:
+                dff["Opportunity"] = dff.apply(opportunity_score, axis=1)
+                opp = dff.sort_values("Opportunity", ascending=False)[["Name","Rating","Reviews","Opportunity","Address"]].head(5)
+                st.dataframe(opp, use_container_width=True)
 
-                st.markdown("---")
-                st.subheader("Place details & recent reviews")
-                name_choice = st.selectbox("Select a business", list(dff["Name"]))
-                chosen = dff[dff["Name"] == name_choice].iloc[0]
-                try:
-                    details = get_place_details(chosen["PlaceID"])
-                    st.write(f"**{details.get('name','')}**")
-                    st.write(details.get("formatted_address",""))
-                    phone = details.get("formatted_phone_number","")
-                    if phone: st.write(phone)
-                    st.write(f"Rating: **{details.get('rating',0)}** ({details.get('user_ratings_total',0)} reviews)")
-                    site = details.get("website","")
-                    if site: st.write(site)
+            # Table + export
+            st.markdown("### Competitor list (filtered)")
+            st.dataframe(dff, use_container_width=True)
+            st.download_button("⬇️ Export filtered CSV", dff.to_csv(index=False).encode(),
+                               "competitors_filtered.csv", "text/csv")
 
-                    if (details.get("opening_hours") or {}).get("weekday_text"):
-                        with st.expander("Opening hours"):
-                            for line in details["opening_hours"]["weekday_text"]:
-                                st.write(line)
+            # Details + Reviews
+            st.markdown("---")
+            st.subheader("Place details & recent reviews")
+            name_choice = st.selectbox("Select a business", list(dff["Name"]))
+            chosen = dff[dff["Name"] == name_choice].iloc[0]
+            try:
+                details = get_place_details(chosen["PlaceID"])
+                st.write(f"**{details.get('name','')}**")
+                st.write(details.get("formatted_address",""))
+                phone = details.get("formatted_phone_number","")
+                if phone: st.write(phone)
+                st.write(f"Rating: **{details.get('rating',0)}** ({details.get('user_ratings_total',0)} reviews)")
+                site = details.get("website","")
+                if site: st.write(site)
 
-                    st.markdown("#### Recent reviews")
-                    revs = details.get("reviews", []) or []
-                    if not revs:
-                        st.info("No reviews available from Google for this place.")
-                    else:
-                        for r in revs:
-                            author = r.get("author_name","Anonymous")
-                            rating = r.get("rating","?")
-                            when   = r.get("relative_time_description","")
-                            st.markdown(f"**{author}** — {rating}★ — {when}")
-                            st.write(r.get("text",""))
-                            st.markdown("---")
-                except Exception as e:
-                    st.error(f"Details error: {e}")
+                if (details.get("opening_hours") or {}).get("weekday_text"):
+                    with st.expander("Opening hours"):
+                        for line in details["opening_hours"]["weekday_text"]:
+                            st.write(line)
+
+                st.markdown("#### Recent reviews")
+                revs = details.get("reviews", []) or []
+                if not revs:
+                    st.info("No reviews available from Google for this place.")
+                else:
+                    for r in revs:
+                        author = r.get("author_name","Anonymous")
+                        rating = r.get("rating","?")
+                        when   = r.get("relative_time_description","")
+                        st.markdown(f"**{author}** — {rating}★ — {when}")
+                        st.write(r.get("text",""))
+                        st.markdown("---")
+            except Exception as e:
+                st.error(f"Details error: {e}")
+
         except Exception as e:
             st.error(f"Google Places error: {e}")
 
-    st.caption("Set GOOGLE_PLACES_API_KEY in Secrets. Text Search + Place Details are used.")
+    st.caption("Requires Places API and Geocoding API enabled. Key must be restricted to those APIs.")
 
-
+# --------------------------------------------------------------------
+# TAB 2 — ARS Lead Follow-Up (unchanged)
+# --------------------------------------------------------------------
 with tab2:
     st.subheader("Generate a 3-step follow-up plan using your private ARS backend")
     st.caption("Make sure your ARS FastAPI server is live; set ARS_URL and ARS_SECRET in Secrets.")
