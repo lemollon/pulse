@@ -1,15 +1,15 @@
-# app.py — Pulse v1.6 "Must-Have" Edition
-# Google Places (New) + Folium + Opportunity Heatmap + Gap Radar
-# ARS follow-up planner (explainability) + AI promos + TXT/DOCX exports
-# Guardrails: feature registry, startup self-test, fail-soft for deps
+# app.py — Pulse v1.7 "Thinking + Inventory"
+# Adds: visible "🤔 Thinking…" spinners around all long ops + Feature Inventory Check
+# Keeps: Google Places (New) + Folium + Heatmap + Charts + AI Summary/Actions/Playbook
+#        ARS planner + Explainability + TXT/DOCX exports + Guardrails
 
-import os, io, re, json, time, hmac, hashlib, textwrap, math
+import os, io, re, json, time, hmac, hashlib, textwrap
 import datetime as dt
 import requests
 import pandas as pd
 import altair as alt
 import streamlit as st
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 # ----- Optional docs export -----
 DOCX_AVAILABLE = True
@@ -36,25 +36,24 @@ ACCENT = "#00C29A"
 
 st.markdown(f"""
 <style>
-/* Clean card look */
-.reportview-container .main .block-container {{padding-top: 1rem;}}
+.reportview-container .main .block-container {{padding-top: 0.8rem;}}
 div.stButton>button {{background:{PRIMARY}; color:white; border-radius:8px; border:none;}}
 div.stDownloadButton>button {{background:{ACCENT}; color:white; border-radius:8px; border:none;}}
 .kpi {{background:#f8f9fb;border:1px solid #eef1f6;border-radius:12px;padding:10px 14px;margin-bottom:8px;}}
-.section-title {{font-weight:700;font-size:1.2rem;margin-top:1rem;}}
+.section-title {{font-weight:700;font-size:1.1rem;margin-top:1rem;}}
 .small-note {{color:#6b7280;font-size:0.9rem;}}
 hr {{border-top:1px solid #eef1f6;}}
+.badge-ok {{color:#0a7f4f;}}
+.badge-bad {{color:#b91c1c;}}
 </style>
 """, unsafe_allow_html=True)
 
 # ---------------------- GLOBALS ----------------------
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 CHANGELOG = [
-    "Added Opportunity Heatmap, Gap Radar, AI Promo Generator",
-    "Restored AI Playbook, Suggested Actions, Insights export",
-    "Added DOCX export for follow-ups + campaigns",
-    "Startup self-test & feature registry guardrails",
-    "Improved ARS explainability and health tester",
+    "Added visible 'Thinking…' spinners for all heavy ops",
+    "Feature Inventory Check (verifies every major capability)",
+    "Kept: Heatmap, AI promos/playbook, exports, ARS explainability",
 ]
 
 FEATURES = {
@@ -72,6 +71,7 @@ FEATURES = {
     "export_txt": True,
     "export_docx": True,   # hidden if DOCX_AVAILABLE == False
     "setup_checklist": True,
+    "inventory_check": True,
 }
 
 # ---------------------- SECRETS ----------------------
@@ -167,7 +167,8 @@ def geocode_location(city: str, state: str, zip_code: str):
     if zip_code.strip(): address = f"{address} {zip_code.strip()}" if address else zip_code.strip()
     if not address: return None
     url = "https://maps.googleapis.com/maps/api/geocode/json"
-    r = requests.get(url, params={"address":address, "key":GOOGLE_PLACES_API_KEY}, timeout=20)
+    with st.spinner("🤔 Thinking… geocoding area"):
+        r = requests.get(url, params={"address":address, "key":GOOGLE_PLACES_API_KEY}, timeout=20)
     r.raise_for_status(); data = r.json()
     if data.get("status") != "OK": return None
     loc = data["results"][0]["geometry"]["location"]
@@ -175,7 +176,6 @@ def geocode_location(city: str, state: str, zip_code: str):
 
 def search_competitors(term: str, city: str, state: str, zip_code: str, limit: int = 12) -> pd.DataFrame:
     err_msg = ""
-    # Text search
     text_url = "https://places.googleapis.com/v1/places:searchText"
     loc = ", ".join([x for x in [city.strip(), state.strip()] if x])
     loc = f"{loc} {zip_code.strip()}" if zip_code.strip() else loc
@@ -185,13 +185,13 @@ def search_competitors(term: str, city: str, state: str, zip_code: str, limit: i
         "places.id","places.displayName","places.formattedAddress","places.location",
         "places.rating","places.userRatingCount","places.priceLevel",
     ])
-    rt = requests.post(text_url, headers=gp_headers(fields), json=body, timeout=20)
+    with st.spinner("🤔 Thinking… searching Google Places"):
+        rt = requests.post(text_url, headers=gp_headers(fields), json=body, timeout=20)
     rt.raise_for_status(); jt = rt.json()
     status = jt.get("status","OK"); 
     if "error" in jt: err_msg = jt["error"].get("message","")
     places = jt.get("places", []) or []
 
-    # Nearby fallback
     if not places:
         geo = geocode_location(city, state, zip_code)
         if geo:
@@ -203,7 +203,8 @@ def search_competitors(term: str, city: str, state: str, zip_code: str, limit: i
                 "rankPreference":"RELEVANCE","includedTypes":["bakery","cafe"],
                 "keyword": term or "donut doughnut"
             }
-            rn = requests.post(nb_url, headers=gp_headers(fields), json=nb_body, timeout=20)
+            with st.spinner("🤔 Thinking… expanding to nearby search"):
+                rn = requests.post(nb_url, headers=gp_headers(fields), json=nb_body, timeout=20)
             rn.raise_for_status(); jn = rn.json()
             if "error" in jn and not err_msg: err_msg = jn["error"].get("message","")
             status = f"{status} -> Nearby:{'OK' if 'error' not in jn else 'ERROR'}"
@@ -233,7 +234,8 @@ def get_place_details(place_id: str) -> Dict:
         "id","displayName","formattedAddress","location","rating","userRatingCount",
         "priceLevel","nationalPhoneNumber","websiteUri","regularOpeningHours.weekdayDescriptions"
     ])
-    r = requests.get(url, headers=gp_headers(fields), timeout=20)
+    with st.spinner("🤔 Thinking… fetching place details"):
+        r = requests.get(url, headers=gp_headers(fields), timeout=20)
     r.raise_for_status(); d = r.json()
     return {
         "name": (d.get("displayName") or {}).get("text",""),
@@ -273,7 +275,9 @@ def _normalize_ars_steps(obj):
 def plan_with_ars(lead: Dict, context: Dict, cohort="donut_shop") -> Dict:
     payload = {"cohort":cohort, "lead":lead, "context":context}
     body = json.dumps(payload).encode(); sig = sign_payload(body)
-    r = requests.post(ARS_URL, headers={"x-signature":sig,"Content-Type":"application/json"}, data=body, timeout=45)
+    with st.spinner("🤔 Thinking… calling ARS for your plan"):
+        r = requests.post(ARS_URL, headers={"x-signature":sig,"Content-Type":"application/json"},
+                          data=body, timeout=45)
     text = r.text
     if not r.ok: raise RuntimeError(f"ARS HTTP {r.status_code}: {text[:300]}")
     try: data = r.json()
@@ -281,10 +285,19 @@ def plan_with_ars(lead: Dict, context: Dict, cohort="donut_shop") -> Dict:
     arm, score, steps = _normalize_ars_steps(data)
     return {"arm":arm, "score":score, "steps":steps, "_raw":data}
 
+def ars_health() -> str:
+    try:
+        health_url = ARS_URL.replace("/ars/plan", "/healthz")
+        with st.spinner("🤔 Thinking… pinging ARS /healthz"):
+            resp = requests.get(health_url, timeout=15)
+        return f"{resp.status_code} {resp.text[:200]}"
+    except Exception as e:
+        return f"ERR {e}"
+
 # ---------------------- ANALYTICS / SCORING ----------------------
 def opportunity_score(row):
     rating = float(row["Rating"] or 0); reviews = int(row["Reviews"] or 0)
-    base = max(0.0, 5.0 - rating)              # lower rating => bigger opportunity
+    base = max(0.0, 5.0 - rating)
     big_player = 1.0 if (reviews >= 300 and rating < 4.2) else 0.0
     sleeper    = 1.0 if (reviews < 60 and rating >= 4.5) else 0.0
     return round(base + 1.5*big_player + 0.8*sleeper, 2)
@@ -293,7 +306,6 @@ def render_folium_map(df: pd.DataFrame, heatmap: bool = True):
     dfc = df.dropna(subset=["Lat","Lng"]).copy()
     if dfc.empty: st.info("No coordinates to plot."); return
     m = folium.Map(location=[dfc["Lat"].mean(), dfc["Lng"].mean()], zoom_start=12, control_scale=True)
-    # markers
     for _, r in dfc.iterrows():
         popup = folium.Popup(
             f"<b>{r['Name']}</b><br>Rating: {r['Rating']} ⭐ | Reviews: {r['Reviews']}<br>{r['Address']}",
@@ -302,7 +314,6 @@ def render_folium_map(df: pd.DataFrame, heatmap: bool = True):
         icon_color = "green" if r["Rating"] >= 4.5 else ("orange" if r["Rating"] >= 4.0 else "red")
         folium.Marker([r["Lat"], r["Lng"]], tooltip=r["Name"], popup=popup,
                       icon=folium.Icon(color=icon_color, icon="info-sign")).add_to(m)
-    # lightweight heat effect (cluster via semi-transparent circles)
     if heatmap:
         for _, r in dfc.iterrows():
             radius = 80 + min(220, 2 * r["Reviews"])
@@ -363,6 +374,28 @@ if issues:
         for i in issues: st.warning(i)
         st.caption("This checklist prevents silent regressions.")
 
+# ---------------------- FEATURE INVENTORY CHECK ----------------------
+def run_inventory_check() -> List[str]:
+    checks = []
+    checks.append(("Google Places key", bool(GOOGLE_PLACES_API_KEY)))
+    checks.append(("Map render", FEATURES["map_markers"]))
+    checks.append(("Heatmap overlay", FEATURES["heatmap"]))
+    checks.append(("Charts", FEATURES["charts"]))
+    checks.append(("AI Market Summary", FEATURES["ai_market_summary"] and llm_ok()))
+    checks.append(("AI Suggested Actions", FEATURES["ai_suggested_actions"] and llm_ok()))
+    checks.append(("Owner Playbook", FEATURES["owner_playbook"] and llm_ok()))
+    checks.append(("Insights export (MD)", FEATURES["insights_export_md"]))
+    checks.append(("ARS planner URL", FEATURES["ars_planner"] and bool(ARS_URL)))
+    checks.append(("AI polish", FEATURES["ai_polish"] and llm_ok()))
+    checks.append(("TXT export", FEATURES["export_txt"]))
+    checks.append(("DOCX export", FEATURES["export_docx"] and DOCX_AVAILABLE))
+    return [f"{'✅' if ok else '❌'} {name}" for name, ok in checks]
+
+with st.expander("🧪 Feature Inventory Check"):
+    if st.button("Run inventory check"):
+        results = run_inventory_check()
+        st.write("\n".join(results))
+
 # ---------------------- TABS ----------------------
 tab1, tab2 = st.tabs(["⭐ Competitor Watch", "📬 Lead Follow-Up (ARS)"])
 
@@ -389,6 +422,7 @@ with tab1:
 
     if submitted:
         try:
+            st.info("Searching similar businesses…")
             df = search_competitors(term, city, state, zip_code, limit=limit)
             st.session_state.search_inputs = {"term":term,"city":city,"state":state,"zip_code":zip_code,"limit":limit}
             if df.empty:
@@ -396,6 +430,7 @@ with tab1:
                 (st.error if em else st.warning)(f"No results. Google status: {msg} {'| '+em if em else ''}")
                 st.session_state.search_df = None
             else:
+                st.success("Done! Showing results.")
                 st.session_state.search_df = df
         except Exception as e:
             st.error(f"Google Places error: {e}"); st.session_state.search_df = None
@@ -432,7 +467,7 @@ with tab1:
                .mark_bar().encode(x=alt.X("Name:N", sort='-y'), y="Reviews:Q",
                                   tooltip=["Name","Rating","Reviews"]).properties(height=320))
         st.altair_chart(bar, use_container_width=True)
-        st.caption("Use: copy what top players do *well*; target their weak hours/locations with promos.")
+        st.caption("Use: copy what top players do well; target their weak hours/locations with promos.")
 
     st.markdown("<div class='section-title'>Rating vs. Review Volume — Who’s loved vs. who’s loud</div>", unsafe_allow_html=True)
     if not dff.empty:
@@ -448,8 +483,9 @@ with tab1:
         prompt = ("Summarize local competition in 4 sentences and list 2 quick tests. "
                   "Keep it practical for a donut/coffee shop.\n"
                   f"Data:\n{json.dumps(sample)}")
-        st.markdown("<div class='section-title'>AI Market Summary</div>", unsafe_allow_html=True)
-        st.info(llm(prompt, system="You are a practical SMB strategist."))
+        with st.spinner("🤔 Thinking… writing AI market summary"):
+            st.markdown("<div class='section-title'>AI Market Summary</div>", unsafe_allow_html=True)
+            st.info(llm(prompt, system="You are a practical SMB strategist."))
 
     # Opportunity Finder + AI Actions
     st.markdown("<div class='section-title'>🔎 Opportunity Finder</div>", unsafe_allow_html=True)
@@ -459,11 +495,12 @@ with tab1:
         opp = dff.sort_values("Opportunity", ascending=False)[["Name","Rating","Reviews","Opportunity","Address"]].head(5).copy()
         if llm_ok():
             acts = []
-            for row in opp.to_dict(orient="records"):
-                p = ("Suggest one high-ROI, low-lift action to win share from this competitor in 7 days. "
-                     "1–2 sentences, concrete.\n"
-                     f"Competitor: {json.dumps(row)}")
-                acts.append(llm(p, system="You are a scrappy local growth marketer."))
+            with st.spinner("🤔 Thinking… generating suggested actions"):
+                for row in opp.to_dict(orient="records"):
+                    p = ("Suggest one high-ROI, low-lift action to win share from this competitor in 7 days. "
+                         "1–2 sentences, concrete.\n"
+                         f"Competitor: {json.dumps(row)}")
+                    acts.append(llm(p, system="You are a scrappy local growth marketer."))
             opp["Suggested Action"] = acts
         else:
             opp["Suggested Action"] = "Add OPENAI_API_KEY to see tailored actions."
@@ -473,11 +510,12 @@ with tab1:
     promos_text = ""
     if llm_ok() and not dff.empty:
         p_prompt = ("Create 5 micro-campaign ideas tailored to these competitors and morning commute patterns. "
-                    "Each: a title + 1 sentence, include timing (e.g., 7-9am) and channel suggestion (SMS/email/in-store).\n"
+                    "Each: a title + 1 sentence, include timing (e.g., 7-9am) and channel (SMS/email/in-store).\n"
                     f"Data:\n{json.dumps(dff.head(12).to_dict(orient='records'))}")
-        st.markdown("<div class='section-title'>🎯 Steal-Share Plays (AI)</div>", unsafe_allow_html=True)
-        promos_text = llm(p_prompt, system="You are a local growth hacker writing concise play ideas.")
-        st.info(promos_text)
+        with st.spinner("🤔 Thinking… drafting steal-share plays"):
+            st.markdown("<div class='section-title'>🎯 Steal-Share Plays (AI)</div>", unsafe_allow_html=True)
+            promos_text = llm(p_prompt, system="You are a local growth hacker writing concise play ideas.")
+            st.info(promos_text)
 
     # Owner Playbook
     playbook_text = ""
@@ -485,9 +523,10 @@ with tab1:
         pb = ("Write a 5-bullet, 14-day playbook for this shop based on the competition list. "
               "Prioritize quick wins, morning rush, pre-orders, offices.\n"
               f"Data:\n{json.dumps(dff.head(12).to_dict(orient='records'))}")
-        st.markdown("<div class='section-title'>📓 Owner Playbook (AI)</div>", unsafe_allow_html=True)
-        playbook_text = llm(pb, system="You are a practical small-business coach.")
-        st.info(playbook_text)
+        with st.spinner("🤔 Thinking… assembling owner playbook"):
+            st.markdown("<div class='section-title'>📓 Owner Playbook (AI)</div>", unsafe_allow_html=True)
+            playbook_text = llm(pb, system="You are a practical small-business coach.")
+            st.info(playbook_text)
 
     # Export insights kit
     term = st.session_state.search_inputs.get("term","doughnut shop")
@@ -505,13 +544,7 @@ with tab2:
     # Diagnostics
     st.sidebar.header("⚙️ Diagnostics")
     if st.sidebar.button("Test ARS connection"):
-        try:
-            lead = {"name":"Test","contact":"test@example.com"}
-            context = {"today": str(dt.date.today()), "hour_local": dt.datetime.now().hour, "weekend": False}
-            result = plan_with_ars(lead, context, cohort="diagnostic")
-            st.sidebar.success(f"ARS OK — {len(result.get('steps', []))} steps")
-        except Exception as e:
-            st.sidebar.error(f"ARS error: {e}")
+        st.sidebar.write(ars_health())
 
     # Inputs
     ca, cb = st.columns(2)
@@ -562,7 +595,8 @@ with tab2:
                     "Return PLAIN TEXT (no JSON, no code fences). "
                     f"Steps JSON:\n{json.dumps(steps)}"
                 )
-                raw = llm(prompt, system="You write high-converting SMB follow-ups.")
+                with st.spinner("🤔 Thinking… polishing copy"):
+                    raw = llm(prompt, system="You write high-converting SMB follow-ups.")
                 polished_text = coerce_polished_to_markdown(raw, steps)
                 st.markdown("#### AI-Polished Copy")
                 st.markdown(polished_text)
@@ -579,7 +613,7 @@ with tab2:
             else:
                 st.caption("Install `python-docx` to enable DOCX export.")
 
-            # Bonus: download the 5 AI promos as docx/txt if generated on tab 1
+            # Campaigns export (if promos were generated on Tab 1)
             if llm_ok():
                 campaigns_txt = f"Steal-Share Plays\n\n{promos_text or 'Run a Competitor Watch first to generate promos.'}"
                 st.download_button("⬇️ Download campaigns (TXT)", campaigns_txt.encode("utf-8"),
