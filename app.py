@@ -1,4 +1,4 @@
-# app.py — Pulse (Google Places API v1 + Folium map + ARS + AI + session-state + ARS shape fix)
+# app.py — Pulse (Google Places API v1 + Folium map + ARS + AI + session-state + ARS shape fix + ARS health tester)
 import os
 import json
 import hmac
@@ -278,7 +278,6 @@ def plan_with_ars(lead: dict, context: dict, cohort: str = "donut_shop") -> dict
             timeout=30
         )
         # Don't raise immediately: we want helpful message content if any
-        content_type = r.headers.get("Content-Type", "")
         text = r.text
         if not r.ok:
             # Bubble up body for debugging
@@ -286,7 +285,6 @@ def plan_with_ars(lead: dict, context: dict, cohort: str = "donut_shop") -> dict
         try:
             data = r.json()
         except Exception:
-            # If backend returned plain text JSON-like, try to parse
             try:
                 data = json.loads(text)
             except Exception:
@@ -585,6 +583,18 @@ with tab2:
     st.info("**How this page uses AI:** ARS scores features (timing, channel preference, sentiment) "
             "and uses a bandit algorithm to explore what works. As you feed outcomes later (replied/booked), "
             "it will adapt sequences to your market.")
+
+    # --------- Quick ARS connectivity test ----------
+    test_col, _ = st.columns([1,3])
+    with test_col:
+        if st.button("Test ARS health"):
+            try:
+                health_url = ARS_URL.replace("/ars/plan", "/healthz")
+                resp = requests.get(health_url, timeout=10)
+                st.write("Health status:", resp.status_code)
+                st.code(resp.text[:200] if resp.text else "<no body>")
+            except Exception as e:
+                st.error(f"Health check failed: {e}")
 
     colA, colB = st.columns(2)
     with colA:
