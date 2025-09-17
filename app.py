@@ -1,4 +1,4 @@
-# app.py — Pulse (Google Places API v1 + Folium map + ARS + AI summaries & playbooks)
+# app.py — Pulse (Google Places API v1 + Folium map + ARS + AI + session-state)
 import os
 import json
 import hmac
@@ -15,6 +15,12 @@ from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Pulse — Google Places + ARS", page_icon="💼", layout="wide")
 st.title("💼 Pulse — Competitor Insights (Google Places) + ARS Follow-Up")
+
+# ---------------- Session defaults (persist search across reruns) ----------------
+if "search_df" not in st.session_state:
+    st.session_state.search_df = None
+if "search_inputs" not in st.session_state:
+    st.session_state.search_inputs = {"term":"doughnut shop", "city":"Fulshear", "state":"TX", "zip_code":"77441", "limit":12}
 
 # --------------------------------------------------------------------
 # Secrets / Keys helpers
@@ -294,19 +300,33 @@ with tab1:
     st.info("**How this page uses AI:** We use Google Places data for facts (ratings, reviews, locations). "
             "If an OpenAI key is provided, AI summarizes the market, suggests quick wins, and builds a mini playbook.")
 
-    col1, col2, col3 = st.columns([1.2,1,1])
-    with col1:
-        term = st.text_input("Category/term", "doughnut shop")
-    with col2:
-        city = st.text_input("City", "Fulshear")
-        state = st.text_input("State (2-letter)", "TX", max_chars=2)
-    with col3:
-        zip_code = st.text_input("ZIP (optional)", "77441")
-    limit = st.slider("How many competitors?", 3, 25, 12)
+    # --------- Input form (persisted via session_state) ----------
+    with st.form("search_form"):
+        inputs = st.session_state.search_inputs
+        col1, col2, col3 = st.columns([1.2,1,1])
+        with col1:
+            term = st.text_input("Category/term", inputs.get("term", "doughnut shop"))
+        with col2:
+            city = st.text_input("City", inputs.get("city", "Fulshear"))
+            state = st.text_input("State (2-letter)", inputs.get("state", "TX"), max_chars=2)
+        with col3:
+            zip_code = st.text_input("ZIP (optional)", inputs.get("zip_code", "77441"))
+        limit = st.slider("How many competitors?", 3, 25, inputs.get("limit", 12))
+        submitted = st.form_submit_button("Search")
 
-    if st.button("Search"):
+    # Clear button
+    clear_col, _ = st.columns([1,3])
+    with clear_col:
+        if st.button("Clear results"):
+            st.session_state.search_df = None
+            st.session_state.search_inputs = {"term":"doughnut shop", "city":"Fulshear", "state":"TX", "zip_code":"77441", "limit":12}
+            st.experimental_rerun()
+
+    # Run search only on submit; persist results & inputs
+    if submitted:
         try:
             df = search_competitors(term, city, state, zip_code, limit=limit)
+            st.session_state.search_inputs = {"term": term, "city": city, "state": state, "zip_code": zip_code, "limit": limit}
             if df.empty:
                 msg = getattr(df, "_search_status", "UNKNOWN")
                 em  = getattr(df, "_error_message", "")
@@ -314,163 +334,178 @@ with tab1:
                     st.error(f"No results. Google said: {msg}. Error: {em}")
                 else:
                     st.warning(f"No results. Try broader terms or nearby locations. (Google status: {msg})")
-                st.stop()
-
-            # Filters
-            f1, f2, f3 = st.columns(3)
-            with f1:
-                min_reviews = st.slider("Min reviews", 0, int(df["Reviews"].max() or 0), 10, step=5)
-            with f2:
-                min_rating  = st.slider("Min rating", 0.0, 5.0, 3.5, step=0.1)
-            with f3:
-                top_n       = st.slider("Show top N by reviews", 3, min(20, len(df)), min(10, len(df)))
-
-            dff = df[(df["Reviews"] >= min_reviews) & (df["Rating"] >= min_rating)].copy()
-            dff = dff.sort_values(["Reviews","Rating"], ascending=[False, False]).head(top_n)
-
-            # KPIs
-            k1,k2,k3 = st.columns(3)
-            k1.metric("Shown", len(dff))
-            k2.metric("Avg rating", f"{dff['Rating'].mean():.2f}" if len(dff) else "–")
-            k3.metric("Median reviews", int(dff["Reviews"].median() if len(dff) else 0))
-
-            # Map
-            st.markdown("### Map of competitors")
-            st.caption("**What this is:** A real map of similar businesses near your search area.\n\n"
-                       "**How to use it:** Hover or click a pin to see name, rating, reviews, and address. "
-                       "Zoom to find clusters (e.g., office parks, commuter routes).")
-            render_folium_map(dff)
-
-            # Charts — Bar
-            st.markdown("### Top 10 by reviews — *Local awareness leaderboard*")
-            st.caption("**What this is:** Bars sorted by total public review count (a proxy for foot traffic/awareness). \n"
-                       "**How to use it:** The top bars are the loudest competitors; copy what works or target their weak hours.")
-            if not dff.empty:
-                bar = (
-                    alt.Chart(dff.sort_values(["Reviews","Rating"], ascending=[False,False]).head(10))
-                    .mark_bar()
-                    .encode(x=alt.X("Name:N", sort='-y', title="Business"),
-                            y=alt.Y("Reviews:Q", title="Review count"),
-                            tooltip=["Name","Rating","Reviews"])
-                    .properties(height=350)
-                )
-                st.altair_chart(bar, use_container_width=True)
-
-            # Charts — Scatter
-            st.markdown("### Rating vs. Review Volume — *Who’s loved vs. who’s loud*")
-            st.caption("**What this is:** Each dot is a business. X = total reviews (awareness), Y = average rating (satisfaction).\n"
-                       "**How to use it:** High-reviews + low-rating = big player with weaknesses → win customers with better service/promos.")
-            if not dff.empty:
-                scatter = (
-                    alt.Chart(dff)
-                    .mark_circle(size=80)
-                    .encode(x=alt.X("Reviews:Q", title="Review count"),
-                            y=alt.Y("Rating:Q", title="Rating"),
-                            tooltip=["Name","Rating","Reviews","Address"])
-                    .interactive()
-                    .properties(height=350)
-                )
-                st.altair_chart(scatter, use_container_width=True)
-
-            # AI Market Summary
-            if llm_available() and not dff.empty:
-                sample_rows = dff.head(12)[["Name","Rating","Reviews","Address"]].to_dict(orient="records")
-                prompt = (
-                    "You are analyzing a local market for a small business owner.\n"
-                    "Given this list of competitors (name, rating, reviews, address), summarize "
-                    "1) what the market looks like, and 2) two quick wins they can test this week. "
-                    f"Competitors JSON:\n{json.dumps(sample_rows)}"
-                )
-                st.markdown("### AI Market Summary")
-                st.info(llm(prompt))
+                st.session_state.search_df = None
             else:
-                st.caption("Tip: add `OPENAI_API_KEY` in Secrets to get AI summaries and suggested actions.")
-
-            # Opportunity Finder (with AI actions)
-            st.markdown("### 🔎 Opportunity Finder")
-            st.caption(
-                "**What this is:** A ranked list of where you can steal share quickly.\n"
-                "- **Opportunity** = (5 − rating) + bonus if they’re big but weak, "
-                "or if there’s a sleeper with great rating but low visibility.\n"
-                "**How to use it:** Start at the top row; run the suggested action for 7 days and measure results."
-            )
-            opp = None
-            if not dff.empty:
-                dff["Opportunity"] = dff.apply(opportunity_score, axis=1)
-                opp = dff.sort_values("Opportunity", ascending=False)[
-                    ["Name","Rating","Reviews","Opportunity","Address"]
-                ].head(5).copy()
-
-                # LLM suggested actions
-                if llm_available():
-                    actions = []
-                    for row in opp.to_dict(orient="records"):
-                        prompt = (
-                            "Suggest one high-ROI, low-lift action a donut shop could take to win customers "
-                            "from this competitor within 7 days. Keep it to 1–2 sentences, concrete and testable.\n"
-                            f"Competitor: {json.dumps(row)}"
-                        )
-                        actions.append(llm(prompt, system="You are a scrappy local growth marketer."))
-                    opp["Suggested Action"] = actions
-                else:
-                    opp["Suggested Action"] = "Add OPENAI_API_KEY to see tailored actions."
-
-                st.dataframe(opp, use_container_width=True)
-
-            # Owner Playbook (AI)
-            playbook_text = ""
-            if llm_available() and not dff.empty:
-                pb_prompt = (
-                    "Create a short 5-bullet playbook for a donut shop to grow sales in the next 14 days, "
-                    "based on these competitors (name, rating, reviews, address). Be practical and specific.\n"
-                    f"Data:\n{json.dumps(dff.head(12).to_dict(orient='records'))}"
-                )
-                st.markdown("### Owner Playbook (AI)")
-                playbook_text = llm(pb_prompt, system="You are a practical small-business growth strategist.")
-                st.info(playbook_text)
-
-            # Details (single place)
-            st.markdown("---")
-            st.subheader("Place details")
-            name_choice = st.selectbox("Select a business", list(dff["Name"]))
-            chosen = dff[dff["Name"] == name_choice].iloc[0]
-            try:
-                details = get_place_details(chosen["PlaceID"])
-                st.write(f"**{details.get('name','')}**")
-                st.write(details.get("formatted_address",""))
-                phone = details.get("formatted_phone_number","")
-                if phone: st.write(phone)
-                st.write(f"Rating: **{details.get('rating',0)}** ({details.get('user_ratings_total',0)} reviews)")
-                site = details.get("website","")
-                if site: st.write(site)
-
-                if (details.get("opening_hours") or {}).get("weekday_text"):
-                    with st.expander("Opening hours"):
-                        for line in details["opening_hours"]["weekday_text"]:
-                            st.write(line)
-
-                revs = details.get("reviews", []) or []
-                if llm_available() and revs:
-                    texts = [r.get("text","") for r in revs if r.get("text")]
-                    if texts:
-                        prompt = (
-                            "From these customer review snippets, extract:\n"
-                            "1) Top 3 things customers love\n2) Top 3 friction points\n"
-                            "Be brief and specific.\n\n"
-                            f"Reviews:\n{json.dumps(texts[:12])}"
-                        )
-                        st.markdown("#### AI summary — what customers love vs. where they struggle")
-                        st.info(llm(prompt))
-            except Exception as e:
-                st.error(f"Details error: {e}")
-
-            # Export Insights.md
-            insights_md = build_insights_md(term, city, state, dff, opp, playbook_text=playbook_text)
-            st.download_button("⬇️ Download Insights.md", insights_md.encode("utf-8"),
-                               "insights.md", "text/markdown")
-
+                st.session_state.search_df = df
         except Exception as e:
             st.error(f"Google Places error: {e}")
+            st.session_state.search_df = None
+
+    # Always read from session from here on
+    df = st.session_state.search_df
+    inputs = st.session_state.search_inputs
+    if df is None:
+        st.info("Enter a search and press **Search** to see competitors.")
+        st.stop()
+
+    # ------------------------ Filters ------------------------
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        min_reviews = st.slider("Min reviews", 0, int(df["Reviews"].max() or 0), 10, step=5)
+    with f2:
+        min_rating  = st.slider("Min rating", 0.0, 5.0, 3.5, step=0.1)
+    with f3:
+        top_n       = st.slider("Show top N by reviews", 3, min(20, len(df)), min(10, len(df)))
+
+    dff = df[(df["Reviews"] >= min_reviews) & (df["Rating"] >= min_rating)].copy()
+    dff = dff.sort_values(["Reviews","Rating"], ascending=[False, False]).head(top_n)
+
+    # ------------------------ KPIs ------------------------
+    k1,k2,k3 = st.columns(3)
+    k1.metric("Shown", len(dff))
+    k2.metric("Avg rating", f"{dff['Rating'].mean():.2f}" if len(dff) else "–")
+    k3.metric("Median reviews", int(dff["Reviews"].median() if len(dff) else 0))
+
+    # ------------------------ Map ------------------------
+    st.markdown("### Map of competitors")
+    st.caption("**What this is:** A real map of similar businesses near your search area.\n\n"
+               "**How to use it:** Hover or click a pin to see name, rating, reviews, and address. "
+               "Zoom to find clusters (e.g., office parks, commuter routes).")
+    render_folium_map(dff)
+
+    # ------------------------ Charts — Bar ------------------------
+    st.markdown("### Top 10 by reviews — *Local awareness leaderboard*")
+    st.caption("**What this is:** Bars sorted by total public review count (a proxy for foot traffic/awareness). \n"
+               "**How to use it:** The top bars are the loudest competitors; copy what works or target their weak hours.")
+    if not dff.empty:
+        bar = (
+            alt.Chart(dff.sort_values(["Reviews","Rating"], ascending=[False,False]).head(10))
+            .mark_bar()
+            .encode(x=alt.X("Name:N", sort='-y', title="Business"),
+                    y=alt.Y("Reviews:Q", title="Review count"),
+                    tooltip=["Name","Rating","Reviews"])
+            .properties(height=350)
+        )
+        st.altair_chart(bar, use_container_width=True)
+
+    # ------------------------ Charts — Scatter ------------------------
+    st.markdown("### Rating vs. Review Volume — *Who’s loved vs. who’s loud*")
+    st.caption("**What this is:** Each dot is a business. X = total reviews (awareness), Y = average rating (satisfaction).\n"
+               "**How to use it:** High-reviews + low-rating = big player with weaknesses → win customers with better service/promos.")
+    if not dff.empty:
+        scatter = (
+            alt.Chart(dff)
+            .mark_circle(size=80)
+            .encode(x=alt.X("Reviews:Q", title="Review count"),
+                    y=alt.Y("Rating:Q", title="Rating"),
+                    tooltip=["Name","Rating","Reviews","Address"])
+            .interactive()
+            .properties(height=350)
+        )
+        st.altair_chart(scatter, use_container_width=True)
+
+    # ------------------------ AI Market Summary ------------------------
+    if llm_available() and not dff.empty:
+        sample_rows = dff.head(12)[["Name","Rating","Reviews","Address"]].to_dict(orient="records")
+        prompt = (
+            "You are analyzing a local market for a small business owner.\n"
+            "Given this list of competitors (name, rating, reviews, address), summarize "
+            "1) what the market looks like, and 2) two quick wins they can test this week. "
+            f"Competitors JSON:\n{json.dumps(sample_rows)}"
+        )
+        st.markdown("### AI Market Summary")
+        st.info(llm(prompt))
+    else:
+        st.caption("Tip: add `OPENAI_API_KEY` in Secrets to get AI summaries and suggested actions.")
+
+    # ------------------------ Opportunity Finder ------------------------
+    st.markdown("### 🔎 Opportunity Finder")
+    st.caption(
+        "**What this is:** A ranked list of where you can steal share quickly.\n"
+        "- **Opportunity** = (5 − rating) + bonus if they’re big but weak, "
+        "or if there’s a sleeper with great rating but low visibility.\n"
+        "**How to use it:** Start at the top row; run the suggested action for 7 days and measure results."
+    )
+    opp = None
+    if not dff.empty:
+        dff["Opportunity"] = dff.apply(opportunity_score, axis=1)
+        opp = dff.sort_values("Opportunity", ascending=False)[
+            ["Name","Rating","Reviews","Opportunity","Address"]
+        ].head(5).copy()
+
+        # LLM suggested actions
+        if llm_available():
+            actions = []
+            for row in opp.to_dict(orient="records"):
+                prompt = (
+                    "Suggest one high-ROI, low-lift action a donut shop could take to win customers "
+                    "from this competitor within 7 days. Keep it to 1–2 sentences, concrete and testable.\n"
+                    f"Competitor: {json.dumps(row)}"
+                )
+                actions.append(llm(prompt, system="You are a scrappy local growth marketer."))
+            opp["Suggested Action"] = actions
+        else:
+            opp["Suggested Action"] = "Add OPENAI_API_KEY to see tailored actions."
+
+        st.dataframe(opp, use_container_width=True)
+
+    # ------------------------ Owner Playbook (AI) ------------------------
+    playbook_text = ""
+    if llm_available() and not dff.empty:
+        pb_prompt = (
+            "Create a short 5-bullet playbook for a donut shop to grow sales in the next 14 days, "
+            "based on these competitors (name, rating, reviews, address). Be practical and specific.\n"
+            f"Data:\n{json.dumps(dff.head(12).to_dict(orient='records'))}"
+        )
+        st.markdown("### Owner Playbook (AI)")
+        playbook_text = llm(pb_prompt, system="You are a practical small-business growth strategist.")
+        st.info(playbook_text)
+
+    # ------------------------ Details (single place) ------------------------
+    st.markdown("---")
+    st.subheader("Place details")
+    name_choice = st.selectbox("Select a business", list(dff["Name"]))
+    chosen = dff[dff["Name"] == name_choice].iloc[0]
+    try:
+        details = get_place_details(chosen["PlaceID"])
+        st.write(f"**{details.get('name','')}**")
+        st.write(details.get("formatted_address",""))
+        phone = details.get("formatted_phone_number","")
+        if phone: st.write(phone)
+        st.write(f"Rating: **{details.get('rating',0)}** ({details.get('user_ratings_total',0)} reviews)")
+        site = details.get("website","")
+        if site: st.write(site)
+
+        if (details.get("opening_hours") or {}).get("weekday_text"):
+            with st.expander("Opening hours"):
+                for line in details["opening_hours"]["weekday_text"]:
+                    st.write(line)
+
+        # Optional AI: summarize reviews if present
+        revs = details.get("reviews", []) or []
+        if llm_available() and revs:
+            texts = [r.get("text","") for r in revs if r.get("text")]
+            if texts:
+                prompt = (
+                    "From these customer review snippets, extract:\n"
+                    "1) Top 3 things customers love\n2) Top 3 friction points\n"
+                    "Be brief and specific.\n\n"
+                    f"Reviews:\n{json.dumps(texts[:12])}"
+                )
+                st.markdown("#### AI summary — what customers love vs. where they struggle")
+                st.info(llm(prompt))
+    except Exception as e:
+        st.error(f"Details error: {e}")
+
+    # ------------------------ Export Insights.md ------------------------
+    insights_md = build_insights_md(
+        inputs.get("term","doughnut shop"),
+        inputs.get("city",""),
+        inputs.get("state",""),
+        dff, opp, playbook_text=playbook_text
+    )
+    st.download_button("⬇️ Download Insights.md", insights_md.encode("utf-8"),
+                       "insights.md", "text/markdown")
 
     st.caption("Requires **Places API (New)** and **Geocoding API** enabled. "
                "API key: Application restrictions = None; API restrictions = Places API (New) + Geocoding API.")
@@ -568,3 +603,5 @@ with tab2:
 
 st.markdown("---")
 st.caption("Pulse © — Google Places (New) competitor insights + private ARS follow-ups.")
+
+
