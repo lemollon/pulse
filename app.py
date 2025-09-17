@@ -1,6 +1,6 @@
-# app.py — Pulse v1.7.1 (Theme Toggle + All Features + KPI Fix)
+# app.py — Pulse v1.7.2 (Theme Toggle + KPI Fix + safe_rerun)
 
-import os, io, re, json, time, hmac, hashlib, textwrap
+import os, io, re, json, hmac, hashlib, textwrap
 import datetime as dt
 from typing import Dict, List
 
@@ -28,11 +28,21 @@ except Exception:
     OpenAI = None
 
 # ---------------------- Page / Meta ----------------------
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 PRIMARY = "#6B5BFF"
 ACCENT = "#00C29A"
 
 st.set_page_config(page_title="Pulse — Win Your Neighborhood", page_icon="🧭", layout="wide")
+
+# ---------------------- Safe rerun helper ----------------------
+def safe_rerun():
+    try:
+        st.rerun()
+    except AttributeError:
+        try:
+            st.experimental_rerun()
+        except Exception:
+            pass
 
 # ---------------------- Secrets ----------------------
 def _secret(name: str, default: str = "") -> str:
@@ -396,7 +406,7 @@ with tab1:
     if st.button("Clear results"):
         st.session_state.search_df = None
         st.session_state.search_inputs = {"term":"doughnut shop","city":"Fulshear","state":"TX","zip_code":"77441","limit":12}
-        st.experimental_rerun()
+        safe_rerun()
 
     if submitted:
         try:
