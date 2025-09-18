@@ -1,8 +1,11 @@
-# app.py — Pulse v1.7.2 (Theme Toggle + KPI Fix + safe_rerun)
+# app.py — Pulse v1.8.0
+# Complete build: non-jargony UX, Google Places (New), Folium map, KPIs, AI insights,
+# ARS follow-ups with retries + local fallback, TXT/DOCX exports, theme toggle, safe rerun.
 
-import os, io, re, json, hmac, hashlib, textwrap
+import os, io, re, json, hmac, hashlib, textwrap, time
 import datetime as dt
 from typing import Dict, List
+from urllib.parse import urlparse, urlunparse
 
 import requests
 import pandas as pd
@@ -21,14 +24,14 @@ except Exception:
 import folium
 from streamlit_folium import st_folium
 
-# ---------- OpenAI (optional) ----------
+# ---------- OpenAI (optional, for AI summaries) ----------
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None
 
 # ---------------------- Page / Meta ----------------------
-VERSION = "1.7.2"
+VERSION = "1.8.0"
 PRIMARY = "#6B5BFF"
 ACCENT = "#00C29A"
 
@@ -36,6 +39,7 @@ st.set_page_config(page_title="Pulse — Win Your Neighborhood", page_icon="🧭
 
 # ---------------------- Safe rerun helper ----------------------
 def safe_rerun():
+    """Works on both new & old Streamlit versions."""
     try:
         st.rerun()
     except AttributeError:
@@ -54,11 +58,12 @@ def _secret(name: str, default: str = "") -> str:
 GOOGLE_PLACES_API_KEY = _secret("GOOGLE_PLACES_API_KEY", "")
 OPENAI_API_KEY        = _secret("OPENAI_API_KEY", "")
 ARS_URL               = _secret("ARS_URL", "http://localhost:8080/ars/plan")
-ARS_SECRET            = _secret("ARS_SECRET", "ars_secret_2c5d6a3b7a9f4d0c8e1f5a7b3c9d2e4f").encode()
+ARS_SECRET_RAW        = _secret("ARS_SECRET", "ars_secret_2c5d6a3b7a9f4d0c8e1f5a7b3c9d2e4f")
+ARS_SECRET            = ARS_SECRET_RAW.encode() if isinstance(ARS_SECRET_RAW, str) else ARS_SECRET_RAW
 
 # ---------------------- Theme Toggle (forced) ----------------------
 if "theme" not in st.session_state:
-    st.session_state.theme = "dark"  # default
+    st.session_state.theme = "dark"  # default = dark (best contrast)
 
 with st.sidebar:
     st.markdown("### 🎚️ Theme")
@@ -106,6 +111,53 @@ def inject_css(theme_dark: bool):
     """, unsafe_allow_html=True)
 
 inject_css(THEME_DARK)
+
+# ---------------------- UI helpers (beautiful, non-jargony) ----------------------
+def info_card(title: str, body_md: str):
+    st.markdown(f"""
+    <div style="
+      border:1px solid var(--card-border);
+      background:var(--card-bg);
+      color:var(--card-text);
+      border-radius:12px;
+      padding:14px 16px;
+      margin:6px 0;">
+      <div style="font-weight:700;margin-bottom:6px">{title}</div>
+      <div style="opacity:.95">{body_md}</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+def tiny_badge(text: str, color="#10b981"):
+    st.markdown(
+        f"<span style='padding:.15rem .45rem;border:1px solid {color};"
+        f"border-radius:999px;color:{color};font-size:.85rem;margin-right:.35rem;'>"
+        f"{text}</span>", unsafe_allow_html=True
+    )
+
+# ---------------------- Hero Title + Feature Badges ----------------------
+APP_TITLE = "Pulse — Competitor Insights + Follow-Up Plans"
+st.markdown(f"""
+<h1 style="margin-bottom:0">{APP_TITLE}</h1>
+<p style="margin-top:4px;opacity:.9">
+  <span style="padding:.2rem .5rem;border:1px solid #3b82f6;border-radius:999px;color:#3b82f6">Google Places (New)</span>
+  <span style="padding:.2rem .5rem;border:1px solid #10b981;border-radius:999px;color:#10b981">AI Market Summary</span>
+  <span style="padding:.2rem .5rem;border:1px solid #f59e0b;border-radius:999px;color:#f59e0b">Opportunity Score</span>
+  <span style="padding:.2rem .5rem;border:1px solid #8b5cf6;border-radius:999px;color:#8b5cf6">Ready-to-Send Follow-Ups</span>
+</p>
+""", unsafe_allow_html=True)
+st.caption(f"Pulse v{VERSION} — Theme: {'Dark' if THEME_DARK else 'Light'}")
+
+info_card("What this does",
+          "Type a business category and city. Pulse finds nearby competitors, highlights where you can win, "
+          "and generates a *ready-to-send* follow-up sequence for your leads. No jargon—just moves you can ship this week.")
+
+with st.expander("How it works (60 seconds)"):
+    st.markdown("""
+- **Find & compare:** We use **Google Places (New)** to find similar businesses and show **rating + review volume**.
+- **Opportunity Score:** Lower ratings, big review counts, and gaps on the map = chances to win market share fast.
+- **Playbook & promos:** AI turns the data into a 14-day **Owner Playbook** and **Steal-Share Plays**.
+- **Follow-up engine:** Click **Prepare Follow-Up Engine** (in the sidebar) once per day for instant plan generation.
+""")
 
 # ---------------------- OpenAI helpers ----------------------
 client = OpenAI(api_key=OPENAI_API_KEY) if (OPENAI_API_KEY and OpenAI) else None
@@ -266,10 +318,7 @@ def search_competitors(term: str, city: str, state: str, zip_code: str, limit: i
     df._error_message = err_msg
     return df
 
-# ---------------------- ARS ----------------------
-def sign_payload(body_bytes: bytes) -> str:
-    return hmac.new(ARS_SECRET, body_bytes, hashlib.sha256).hexdigest()
-
+# ---------------------- Follow-Up Engine (ARS) ----------------------
 def _normalize_ars_steps(obj):
     arm, score, steps = None, None, []
     if isinstance(obj, dict):
@@ -292,26 +341,101 @@ def _normalize_ars_steps(obj):
         normed.append({"send_dt":str(send_dt), "channel":channel, "subject":subject, "body":body})
     return arm, score, normed
 
-def plan_with_ars(lead: Dict, context: Dict, cohort="donut_shop") -> Dict:
-    payload = {"cohort":cohort, "lead":lead, "context":context}
+def _fallback_local_plan(lead: Dict, context: Dict, reason: str = "") -> Dict:
+    """Local ready-to-send plan so the UI never blocks."""
+    today = dt.date.today()
+    name = lead.get("name", "there")
+    prefer_sms = (lead.get("channel_pref") or "").lower() == "sms"
+    steps = [
+        {
+            "send_dt": str(today),
+            "channel": "sms" if prefer_sms else "email",
+            "subject": "Quick hello 👋" if not prefer_sms else "",
+            "body": f"Hi {name.split()[0]}, great chatting! Would love to continue the conversation. Any questions I can answer?",
+        },
+        {
+            "send_dt": str(today + dt.timedelta(days=2)),
+            "channel": "sms" if prefer_sms else "email",
+            "subject": "A sweet next step?" if not prefer_sms else "",
+            "body": "Just checking in—can I hold a spot for you this week? We can set up a quick taste test or pre-order.",
+        },
+        {
+            "send_dt": str(today + dt.timedelta(days=7)),
+            "channel": "email",
+            "subject": "Ready when you are 🍩",
+            "body": "Following up with a friendly nudge—happy to help with an office order or weekend pickup. What works best?",
+        },
+    ]
+    return {"arm": "fallback", "score": None, "steps": steps, "_raw": {"error": reason}}
+
+def plan_with_ars(lead: Dict, context: Dict, cohort="donut_shop", retries: int = 3, timeout: int = 45) -> Dict:
+    """Robust client: retries on 5xx/timeouts; on failure, returns local ready-to-send plan."""
+    payload = {"cohort": cohort, "lead": lead, "context": context}
     body = json.dumps(payload).encode()
-    sig = sign_payload(body)
-    r = requests.post(ARS_URL, headers={"x-signature":sig,"Content-Type":"application/json"}, data=body, timeout=45)
-    text = r.text
-    if not r.ok:
-        raise RuntimeError(f"ARS HTTP {r.status_code}: {text[:300]}")
+    sig = hmac.new(ARS_SECRET, body, hashlib.sha256).hexdigest()
+
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = requests.post(
+                ARS_URL,
+                headers={"x-signature": sig, "Content-Type": "application/json"},
+                data=body,
+                timeout=timeout,
+            )
+            txt = r.text
+            if r.status_code >= 500:
+                last_err = f"ARS {r.status_code}: {txt[:200]}"
+                time.sleep(min(1.5 * attempt, 6))
+                continue
+            if not r.ok:
+                raise RuntimeError(f"ARS HTTP {r.status_code}: {txt[:300]}")
+            try:
+                data = r.json()
+            except Exception:
+                data = json.loads(txt)
+            arm, score, steps = _normalize_ars_steps(data)
+            return {"arm": arm, "score": score, "steps": steps, "_raw": data}
+        except requests.exceptions.Timeout as e:
+            last_err = f"Timeout: {e}"
+            time.sleep(min(1.5 * attempt, 6))
+        except requests.exceptions.RequestException as e:
+            last_err = str(e)
+            time.sleep(min(1.5 * attempt, 6))
+    return _fallback_local_plan(lead, context, reason=last_err or "Unknown error")
+
+def warm_ars(pings: int = 3, pause: float = 3.0) -> str:
+    """
+    Hit /healthz and /ars/plan (tiny payload) a few times to wake the engine (Render free tier).
+    Returns a human-readable status string.
+    """
+    if not ARS_URL:
+        return "Follow-Up Engine URL is missing."
     try:
-        data = r.json()
-    except Exception:
-        data = json.loads(text)
-    arm, score, steps = _normalize_ars_steps(data)
-    return {"arm":arm, "score":score, "steps":steps, "_raw":data}
+        u = urlparse(ARS_URL)
+        health = urlunparse((u.scheme, u.netloc, "/healthz", "", "", ""))
+
+        last = ""
+        for i in range(pings):
+            try:
+                r = requests.get(health, timeout=8)
+                last = f"Health {r.status_code}"
+                tiny = {"cohort":"diagnostic","lead":{"name":"ping"},"context":{"today":"1970-01-01"}}
+                r2 = requests.post(ARS_URL, json=tiny, timeout=8)
+                last = f"Warm attempt {i+1}/{pings}: {r2.status_code}"
+            except Exception as e:
+                last = f"Warm attempt {i+1}/{pings} error: {e}"
+            time.sleep(pause)
+        return last
+    except Exception as e:
+        return f"Warmup error: {e}"
 
 # ---------------------- Analytics / Viz helpers ----------------------
 def opportunity_score(row):
+    """Transparent scoring for buyers (explained in UI)."""
     rating = float(row["Rating"] or 0)
     reviews = int(row["Reviews"] or 0)
-    base = max(0.0, 5.0 - rating)                # lower rating => more opportunity
+    base = max(0.0, 5.0 - rating)  # lower rating => more opportunity
     big_player = 1.0 if (reviews >= 300 and rating < 4.2) else 0.0
     sleeper    = 1.0 if (reviews < 60 and rating >= 4.5) else 0.0
     return round(base + 1.5*big_player + 0.8*sleeper, 2)
@@ -336,7 +460,7 @@ def render_folium_map(df: pd.DataFrame, heatmap: bool = True):
             folium.Circle(
                 location=[r["Lat"], r["Lng"]],
                 radius=radius,
-                color="#ff0066" if r["Rating"] < 4.0 else "#00c29a",
+                color="#ff0066" if r["Rating"] < 4.0 else "#00C29A",
                 fill=True, fill_opacity=0.08, opacity=0.15
             ).add_to(m)
     st_folium(m, width=None, height=540)
@@ -367,27 +491,19 @@ if "search_df" not in st.session_state:
 if "search_inputs" not in st.session_state:
     st.session_state.search_inputs = {"term":"doughnut shop", "city":"Fulshear", "state":"TX", "zip_code":"77441", "limit":12}
 
-# ---------------------- Header ----------------------
-left, right = st.columns([3,1])
-with left:
-    st.write(f"**Pulse v{VERSION}** — Win your neighborhood with AI.")
-with right:
-    if st.button("View what's in this build"):
-        st.info("\n".join([
-            "• Theme toggle (forced light/dark)",
-            "• KPI fix + high-contrast UI",
-            "• Google Places (New) search + Nearby fallback",
-            "• Folium map + heat glow",
-            "• AI Market Summary, Opportunity Finder (AI actions)",
-            "• Owner Playbook, Steal-Share Plays",
-            "• Insights.md, TXT & DOCX exports",
-            "• ARS plan + explainability + AI polish"
-        ]))
+# ---------------------- Sidebar: Prepare Follow-Up Engine (non-jargony) ----------------------
+with st.sidebar:
+    st.markdown("### ⚡ Prepare Follow-Up Engine")
+    st.caption("First time today? Press once so your **ready-to-send plan** is instant.")
+    if st.button("Prepare Follow-Up Engine"):
+        msg = warm_ars()
+        st.success(f"Engine is ready • {msg}")
+    st.caption("Tip: Prevents first-call delay on free hosting.")
 
 # ---------------------- Tabs ----------------------
-tab1, tab2 = st.tabs(["⭐ Competitor Watch", "📬 Lead Follow-Up (ARS)"])
+tab1, tab2 = st.tabs(["⭐ Competitor Watch", "📬 Lead Follow-Up"])
 
-# ===================== TAB 1 =====================
+# ===================== TAB 1: COMPETITOR WATCH =====================
 with tab1:
     st.subheader("Find similar businesses via Google Places")
     st.caption("Facts from Google. AI turns it into moves you can ship this week.")
@@ -456,10 +572,34 @@ with tab1:
     with k2: st.markdown(kpi_card("Avg rating", avg_rating_str), unsafe_allow_html=True)
     with k3: st.markdown(kpi_card("Median reviews", med_reviews_str), unsafe_allow_html=True)
 
+    with st.expander("What do these numbers mean?"):
+        st.markdown("""
+- **Shown** — How many competitors are in the view after your filters.
+- **Avg rating** — Average star rating of the shown set.
+- **Median reviews** — Typical review volume (half have more, half have less).
+These help you size the market (volume) and quality (love) at a glance.
+""")
+
     # ---- Map + heat glow
     st.markdown("<div class='section-title'>Map & Heat</div>", unsafe_allow_html=True)
-    st.caption("Hover pins for name/rating/reviews. Colored circles hint at density (hot vs gaps).")
+    st.caption("Pins show business names; colored halos show **density** (hot areas) or **gaps** (opportunities). Hover for details.")
     render_folium_map(dff, heatmap=True)
+
+    # ---- Inspect one competitor (clean selectbox) ----
+    if not dff.empty:
+        name_choice = st.selectbox(
+            "Select a business",
+            options=dff["Name"].astype(str).tolist(),
+            index=0
+        )
+        chosen = dff.loc[dff["Name"] == name_choice]
+        if not chosen.empty:
+            row = chosen.iloc[0]
+            c1, c2, c3 = st.columns(3)
+            with c1: st.metric("Rating", f"{row['Rating']:.2f}")
+            with c2: st.metric("Reviews", int(row["Reviews"]))
+            with c3: st.metric("Price Level", str(row.get("PriceLevel", "—")))
+            st.write("**Address:**", row.get("Address", "—"))
 
     # ---- Charts
     st.markdown("<div class='section-title'>Top 10 by reviews — Local awareness leaderboard</div>", unsafe_allow_html=True)
@@ -511,6 +651,17 @@ with tab1:
             ["Name","Rating","Reviews","Opportunity","Address"]
         ].head(5).copy()
 
+        with st.expander("How we compute Opportunity Score"):
+            st.markdown("""
+**Goal:** Find where you can win share fast.
+
+**Score =** baseline for **(5 – rating)** + bonus for:
+- **Big but vulnerable:** Lots of reviews **and** rating below ~4.2
+- **Sleeper gaps:** Few reviews **but** great ratings (underexposed winners)
+
+Numbers are scaled to make ranking easy; higher = better opportunity.
+""")
+
         if llm_ok():
             acts = []
             for row in opp.to_dict(orient="records"):
@@ -550,20 +701,39 @@ with tab1:
     md = insights_md(term, city, state, dff, opp, playbook_text=playbook_text)
     st.download_button("⬇️ Download Insights.md", md.encode("utf-8"), "insights.md", "text/markdown")
 
-# ===================== TAB 2 =====================
-with tab2:
-    st.subheader("Adaptive Follow-Ups (ARS) + AI Polish")
-    st.caption("ARS picks channels/dates; AI polishes copy. Owners get ready-to-send messages.")
+    # ---- Next steps (conversion helpers)
+    st.markdown("### What to do next")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        info_card("Copy a Winner",
+                  "Pick a top-right business (high rating + reviews). Mirror one **menu item** or **morning bundle** this week.")
+    with c2:
+        info_card("Fill a Gap",
+                  "Drop a **7–9am offer** near a cold zone on the map. Hand flyers to offices within 3 blocks.")
+    with c3:
+        info_card("Follow Up Today",
+                  "Use the **Lead Follow-Up** tab to send a friendly 3-touch sequence. Export to TXT/DOCX.")
 
-    st.sidebar.header("⚙️ Diagnostics")
-    if st.sidebar.button("Test ARS connection"):
-        try:
-            lead = {"name":"Test","contact":"test@example.com"}
-            context = {"today": str(dt.date.today()), "hour_local": dt.datetime.now().hour, "weekend": False}
-            result = plan_with_ars(lead, context, cohort="diagnostic")
-            st.sidebar.success(f"ARS OK — {len(result.get('steps', []))} steps")
-        except Exception as e:
-            st.sidebar.error(f"ARS error: {e}")
+# ===================== TAB 2: FOLLOW-UP =====================
+with tab2:
+    st.subheader("Adaptive Follow-Ups (Ready-to-Send)")
+    st.caption("Pulse creates a **dated, ready-to-send** sequence across email/SMS. Friendly tone; action-oriented copy.")
+
+    st.info("For best speed, click **Prepare Follow-Up Engine** (sidebar) once per day before generating a plan.")
+
+    # Optional diagnostics (kept hidden in an expander to avoid jargon)
+    with st.expander("Advanced (optional): connection test"):
+        if st.button("Quick connection test"):
+            try:
+                lead = {"name":"Test","contact":"test@example.com"}
+                context = {"today": str(dt.date.today()), "hour_local": dt.datetime.now().hour, "weekend": False}
+                result = plan_with_ars(lead, context, cohort="diagnostic")
+                if result.get("arm") == "fallback":
+                    st.warning("Engine returned a local plan — service may be waking up.")
+                else:
+                    st.success(f"Engine OK — {len(result.get('steps', []))} steps")
+            except Exception as e:
+                st.error(f"Connection error: {e}")
 
     ca, cb = st.columns(2)
     with ca:
@@ -588,6 +758,14 @@ with tab2:
             result = plan_with_ars(lead, context, cohort="donut_shop")
             steps = result.get("steps", [])
 
+            if result.get("arm") == "fallback":
+                st.warning("The follow-up engine was briefly asleep, so we generated a **ready-to-send plan** for you locally. "
+                           "Press **Prepare Follow-Up Engine** in the sidebar to keep it instant next time.")
+                raw_err = result.get("_raw", {}).get("error", "")
+                if raw_err:
+                    with st.expander("Technical detail (optional)"):
+                        st.code(raw_err)
+
             st.success(f"Chosen arm: {result.get('arm','?')} • Score: {result.get('score','?')}")
             st.markdown("#### Planned Steps (before AI polish)")
             for s in steps:
@@ -596,7 +774,7 @@ with tab2:
                 st.write(s.get("body",""))
                 st.markdown("---")
 
-            # Explainability
+            # Explainability (plain-English rationale)
             reasons = []
             if pref == "sms": reasons.append("Lead prefers SMS, so we include SMS early.")
             hr = dt.datetime.now().hour
@@ -607,7 +785,7 @@ with tab2:
             st.markdown("#### Why this plan works")
             st.write("\n".join(f"- {r}" for r in reasons))
 
-            # AI polish
+            # AI polish (plain text only)
             polished_text = steps_to_markdown(steps)
             if llm_ok() and steps:
                 prompt = ("Polish these steps for a friendly donut shop brand. "
@@ -635,7 +813,7 @@ with tab2:
             else:
                 st.caption("Install `python-docx` to enable DOCX export.")
         except Exception as e:
-            st.error(f"ARS error: {e}")
+            st.error(f"Follow-Up Engine error: {e}")
 
 # ---------------------- Footer ----------------------
 st.markdown("---")
