@@ -483,4 +483,4 @@ with tab1:
     # Place details
     st.markdown("---")
     st.subheader("Place details")
-    name_choice = st.selectbox("Select a business", list(dff["Name
+   name_choice = st.selectbox("Select a business", list(dff["Name"]))
